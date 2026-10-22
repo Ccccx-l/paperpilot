@@ -1,0 +1,2 @@
+harbor[modal]==0.20.0
+sb-cli==0.1.5
