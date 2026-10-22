@@ -13,6 +13,7 @@ dependencies = [
     "httpx==0.28.1",
     "pydantic==2.13.4",
     "python-dotenv==1.2.2",
+    "pypdf==6.21.2",
 ]
 
 [project.urls]
@@ -20,15 +21,16 @@ Repository = "https://github.com/mini-harness/mini-harness"
 
 [project.scripts]
 mini-harness = "mini_harness.main:main"
+paperpilot = "paperpilot.cli:main"
 
 [dependency-groups]
 dev = ["ruff>=0.6"]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/mini_harness"]
+packages = ["src/mini_harness", "src/paperpilot"]
 
 [tool.hatch.build.targets.sdist]
-include = ["src/mini_harness", "pyproject.toml", "README.md"]
+include = ["src/mini_harness", "src/paperpilot", "pyproject.toml", "README.md"]
 
 [tool.ruff]
 line-length = 100

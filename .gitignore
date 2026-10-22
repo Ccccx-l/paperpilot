@@ -23,6 +23,7 @@ session.json
 mini_harness_*.json
 mini_harness_*.jsonl
 sandbox/
+/papers/
 .local/
 jobs/
 *.tar.gz
