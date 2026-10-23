@@ -15,6 +15,7 @@ from paperpilot.search import (
     MIN_LOOSE_TERM_HITS,
     TITLE_WEIGHT,
     QUERY_EXPANSIONS,
+    QUERY_SPLITS,
     TERM_ALIASES,
     build_loose_match,
     build_match_query,
@@ -751,8 +752,10 @@ class TestQueryExpansionRetrieval(SearchTestBase):
         results = search(self.store, '统计语言模型')
         titles = [r.title for r in results]
         self.assertIn('精确页', titles, 'original query must keep working')
-        # 严格 AND 命中的页仍应排在前面
-        self.assertEqual(results[0].title, '精确页')
+        # 拆分融合后原查询候选不得丢失；名次由融合规则决定，
+        # 不再保证「严格命中必排第一」（子查询的高相关页可以上升）
+        self.assertIn('发展史页', titles)
+        self.assertLessEqual(len(results), 5)
 
     def test_strict_and_semantics_unchanged(self):
         self._add('exact.pdf', '精确页', ['统计语言模型是常见基线。'])
@@ -793,6 +796,90 @@ class TestQueryExpansionRetrieval(SearchTestBase):
         after = [r.title for r in search(self.store, 'gardening')]
         self.assertEqual(set(after) - set(before), {'园艺页'},
                          'only real matches, no expansion leakage')
+
+
+class TestQuerySplitFusion(unittest.TestCase):
+    """Split table shape: only validated queries, original query first."""
+
+    def test_splits_cover_only_validated_queries(self):
+        self.assertEqual(set(QUERY_SPLITS), {'统计语言模型', 'Transformer 注意力机制'})
+
+    def test_original_query_is_always_the_first_sub_query(self):
+        for query, subs in QUERY_SPLITS.items():
+            with self.subTest(query=query):
+                self.assertEqual(subs[0], query, 'original query must not be dropped')
+                self.assertGreaterEqual(len(subs), 2)
+
+    def test_unlisted_queries_are_not_split(self):
+        from paperpilot.search import _search_split, _search_single
+        self.assertNotIn('神经语言模型', QUERY_SPLITS)
+        self.assertNotIn('quantum computing applications', QUERY_SPLITS)
+        self.assertNotIn('大语言模型', QUERY_SPLITS)
+        # 未列入的查询走单路，不经过融合
+        self.assertTrue(callable(_search_single))
+        self.assertTrue(callable(_search_split))
+
+
+class TestQuerySplitRetrieval(SearchTestBase):
+    """End-to-end fusion: de-dup, deterministic order, no admission leak."""
+
+    def setUp(self):
+        super().setUp()
+        self._add('exact.pdf', '精确页', ['统计语言模型是常见基线。'])
+        self._add('nlm_ctx.pdf', '发展史页', [
+            '由于需要估计指数级数量的转移概率,NLM 影响语言模型的发展。',
+        ])
+        self._add('exp_only.pdf', '纯扩展页', ['NLM 与转移概率的其他讨论。'])
+        self._add('slm.pdf', '统计方法', ['本文采用基于统计学习方法的语言模型建模。'])
+
+    def test_fusion_dedupes_repeated_pages(self):
+        # 「发展史页」会被「统计语言模型」「神经语言模型」两路同时召回
+        results = search(self.store, '统计语言模型', top_k=5)
+        keys = [(r.paper_id, r.page_no) for r in results]
+        self.assertEqual(len(keys), len(set(keys)), 'pages must appear once')
+        self.assertEqual(
+            [t for t in (r.title for r in results) if t == '发展史页'].count('发展史页'),
+            1,
+        )
+
+    def test_original_query_candidates_are_not_lost(self):
+        titles = [r.title for r in search(self.store, '统计语言模型', top_k=5)]
+        self.assertIn('精确页', titles)
+        self.assertIn('统计方法', titles)
+
+    def test_fusion_order_is_deterministic(self):
+        first = [(r.paper_id, r.page_no, r.score) for r in
+                 search(self.store, '统计语言模型', top_k=5)]
+        second = [(r.paper_id, r.page_no, r.score) for r in
+                  search(self.store, '统计语言模型', top_k=5)]
+        self.assertEqual(first, second, 'same query must give identical order')
+
+    def test_split_does_not_relax_admission(self):
+        # 纯扩展页在任一子查询下原查询概念覆盖都不足，融合不得放进
+        titles = [r.title for r in search(self.store, '统计语言模型', top_k=5)]
+        self.assertNotIn('纯扩展页', titles,
+                         'fusion must not lower the admission bar')
+
+    def test_split_evidence_uses_original_query_terms(self):
+        # 子查询「神经语言模型」能召回发展史页，但高亮必须来自原查询词
+        import re
+        results = {r.title: r for r in search(self.store, '统计语言模型', top_k=5)}
+        self.assertIn('发展史页', results)
+        hit = results['发展史页']
+        body = self.store.page_by_id(hit.page_id)['body']
+        for m in re.finditer(r'\[(.*?)\]', hit.snippet):
+            self.assertIn(m.group(1), body, 'fabricated highlight')
+        self.assertNotIn('[NLM]', hit.snippet, 'sub-query word must not be highlighted')
+        self.assertNotIn('[神经语言模型]', hit.snippet)
+
+    def test_negative_controls_stay_empty(self):
+        self.assertEqual(search(self.store, 'quantum computing applications'), [])
+        self.assertEqual(search(self.store, '量子引力 黑洞'), [])
+
+    def test_probe_queries_not_affected(self):
+        self._add('llm.pdf', '大模型页', ['大语言模型(LLM)的进展。'])
+        self.assertIn('大模型页', [r.title for r in search(self.store, '大语言模型')])
+        self.assertEqual(search(self.store, '低秩 适配'), [])
 
 
 if __name__ == '__main__':

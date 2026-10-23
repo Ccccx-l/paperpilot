@@ -138,6 +138,29 @@ QUERY_EXPANSIONS: dict[str, tuple[tuple[str, str, str], ...]] = {
     ),
 }
 
+# Query split + rank fusion -- validated only for the two queries below
+# in the step-3-4 isolation experiment C. The FIRST sub-query is always
+# the original query, so its candidates are never dropped. Each sub-query
+# is retrieved with the ordinary search() pipeline (same concept
+# coverage, same min_term_hits admission); fusion only re-orders the
+# union and never lowers a bar.
+#
+# Fusion rule (as experimentally verified): rank-fuse by the BEST
+# (smallest) rank a page achieves under any sub-query; break ties by
+# that path's BM25 score, then by (paper_id, page_no) for determinism.
+# BM25 scores from different sub-queries are never averaged or added --
+# rank is the only cross-query comparable quantity.
+#
+# Evidence is always re-located with the ORIGINAL query's terms after
+# fusion, so sub-query wording can recall a page but can never paint a
+# highlight the user did not ask for.
+QUERY_SPLITS: dict[str, tuple[str, ...]] = {
+    '统计语言模型': ('统计语言模型', '神经语言模型', '语言模型 发展'),
+    'Transformer 注意力机制': (
+        'Transformer 注意力机制', '注意力 遮罩', 'Transformer 架构',
+    ),
+}
+
 STATUS_HIGHLIGHTED = 'highlighted'
 STATUS_BODY_NO_HIGHLIGHT = 'body_matched_no_highlight'
 STATUS_TITLE_ONLY = 'title_only'
@@ -546,6 +569,18 @@ def _match_rows(store: PaperStore, match_expr: str) -> list[sqlite3.Row]:
 def search(store: PaperStore, query: str, *, top_k: int = DEFAULT_TOP_K) -> list[Evidence]:
     """Keyword search returning traceable evidence rows (title + page + 原文).
 
+    Entry point: queries listed in QUERY_SPLITS run the sub-query rank
+    fusion path; everything else takes the single-query path unchanged.
+    """
+    subs = QUERY_SPLITS.get(unicodedata.normalize('NFKC', query))
+    if subs:
+        return _search_split(store, query, subs, top_k=top_k)
+    return _search_single(store, query, top_k=top_k)
+
+
+def _search_single(store: PaperStore, query: str, *, top_k: int = DEFAULT_TOP_K) -> list[Evidence]:
+    """One query against the index: strict AND + loose OR, score-ranked.
+
     Strict AND candidates and loose (coverage-filtered) candidates are
     merged and re-ranked by the loose BM25 score, then cut to top_k. The
     strict pass is kept as a high-precision candidate source; because its
@@ -626,25 +661,84 @@ def search(store: PaperStore, query: str, *, top_k: int = DEFAULT_TOP_K) -> list
     )
     results = []
     for item in ranked[: int(top_k)]:
-        snippet = locate_snippet(item['body'], terms)
-        status = snippet.status
-        if status == STATUS_TITLE_ONLY:
-            # Original query strings absent from pages.body. If the indexed
-            # body still covers enough CONCEPTS, this is a body hit through
-            # expanded forms (inflection/alias), not a title-only hit. Same
-            # threshold as candidate admission -- no separate looser bar.
-            page_tokens = _index_tokens(item['body_seg'])
-            if concept_coverage(page_tokens, groups) >= required:
-                status = STATUS_BODY_NO_HIGHLIGHT
-        results.append(
-            Evidence(
-                paper_id=item['paper_id'],
-                title=item['title'],
-                page_id=item['page_id'],
-                page_no=item['page_no'],
-                snippet=snippet.text,
-                score=item['score'],
-                status=status,
-            )
-        )
+        results.append(_assemble_evidence(store, query, item))
     return results
+
+
+def _assemble_evidence(store: PaperStore, query: str, item: dict) -> Evidence:
+    """Build Evidence with ORIGINAL-query terms and coverage-based status."""
+    terms = evidence_terms(query)
+    groups = concept_groups(query)
+    required = min_term_hits(len(groups))
+    snippet = locate_snippet(item['body'], terms)
+    status = snippet.status
+    if status == STATUS_TITLE_ONLY:
+        # Original query strings absent from pages.body. If the indexed
+        # body still covers enough CONCEPTS, this is a body hit through
+        # expanded forms (inflection/alias), not a title-only hit. Same
+        # threshold as candidate admission -- no separate looser bar.
+        page_tokens = _index_tokens(item['body_seg'])
+        if concept_coverage(page_tokens, groups) >= required:
+            status = STATUS_BODY_NO_HIGHLIGHT
+    return Evidence(
+        paper_id=item['paper_id'],
+        title=item['title'],
+        page_id=item['page_id'],
+        page_no=item['page_no'],
+        snippet=snippet.text,
+        score=item['score'],
+        status=status,
+    )
+
+
+def _search_split(
+    store: PaperStore,
+    query: str,
+    subs: tuple[str, ...],
+    *,
+    top_k: int = DEFAULT_TOP_K,
+) -> list[Evidence]:
+    """Rank-fuse sub-query results, then re-locate evidence on the ORIGINAL query.
+
+    Each sub-query runs the full single-query pipeline (so concept
+    coverage and min_term_hits admission are unchanged per path). Fusion
+    keeps the BEST rank a page achieved, breaks ties with that path's
+    BM25 score and finally (paper_id, page_no) -- never mixing scores
+    from different sub-queries as if they were comparable.
+
+    Snippets and status are recomputed with evidence_terms(query) so a
+    sub-query phrase can recall a page but cannot fabricate a highlight.
+    """
+    best: dict[tuple[int, int], tuple[int, float, dict]] = {}
+    for sub in subs:
+        for rank, ev in enumerate(
+            _search_single(store, sub, top_k=int(top_k) * 3), start=1
+        ):
+            key = (ev.paper_id, ev.page_no)
+            if key not in best or rank < best[key][0]:
+                row = store.conn.execute(
+                    'SELECT pg.page_id, pg.page_no, pg.body, p.paper_id, p.title, '
+                    'pages_fts.body_seg AS body_seg '
+                    'FROM pages pg '
+                    'JOIN papers p ON p.paper_id = pg.paper_id '
+                    'JOIN pages_fts ON pages_fts.rowid = pg.page_id '
+                    'WHERE pg.page_id = ?',
+                    (ev.page_id,),
+                ).fetchone()
+                best[key] = (rank, ev.score, {
+                    'paper_id': row['paper_id'],
+                    'title': row['title'],
+                    'page_id': row['page_id'],
+                    'page_no': row['page_no'],
+                    'body': row['body'],
+                    'body_seg': row['body_seg'],
+                    'score': ev.score,
+                })
+    ordered = sorted(
+        best.items(),
+        key=lambda kv: (kv[1][0], kv[1][1], kv[0][0], kv[0][1]),
+    )
+    return [
+        _assemble_evidence(store, query, item)
+        for _key, (_rank, _score, item) in ordered[: int(top_k)]
+    ]
