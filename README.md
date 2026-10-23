@@ -1,191 +1,190 @@
-<div align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.svg">
-    <source media="(prefers-color-scheme: light)" srcset="assets/logo-light.svg">
-    <img src="assets/logo-light.svg" alt="mini-harness" width="420">
-  </picture>
-</div>
+# PaperPilot
 
-<p align="center">
-  <img src="assets/demo.gif" alt="Real DeepSeek Agent writes a Python file, runs it in a Docker sandbox, and answers a follow-up question" width="900">
-  <br>
-  <sub>Real DeepSeek V4 Flash · 12.8 s replay · <a href="assets/demo.mp4">120 fps video</a></sub>
-</p>
+**面向科研论文的本地长程研究 Agent**——导入 PDF、全文检索、返回可追溯的原文证据
+（论文标题 + 页码 + 原文片段），再由你配置的大模型依据证据作答。
 
-## Why mini-harness?
+PaperPilot 基于本仓库内置的 `mini-harness`（一个最小编码 Agent harness）构建，
+复用它的 Agent 主循环、工具执行器与配置机制；论文工具与检索链路是独立模块。
 
-- **Small, but complete.** About 1,700 lines of Python: nine tools, context
-  compaction, request retries, streaming responses, and session memory.
-- **Tools defined with Pydantic.** Typed inputs, generated JSON Schema, and
-  validation before execution make tools easier to compose and orchestrate.
-- **A practical baseline.** Evaluated on SWE-bench Verified and Terminal-Bench
-  2.1 with DeepSeek V4 Flash. See the results below.
-- **Built for learning.** Follow the [agent loop](src/mini_harness/agent.py),
-  [tools](src/mini_harness/tool/box.py), [compaction](src/mini_harness/compact.py),
-  and [retry policy](src/mini_harness/retry_request.py) in ordinary Python.
-  The optional [TUI](tui.py) is a single file you can read and modify.
+> **定位**：开发者/科研人员的仓库式本地工具。克隆、装依赖、配好自己的模型服务，
+> 就能在终端用自己的论文做研究。它不是云端 SaaS，也没有图形界面。
 
-## Benchmarks
+---
 
-Historical, self-reported results with **DeepSeek V4 Flash**. The latest source
-changes have not been re-evaluated on these benchmarks.
+## 核心能力
 
-| Benchmark | Solved / attempts | Score |
-| --- | ---: | ---: |
-| SWE-bench Verified | 401 / 500 | **80.2%** |
-| Terminal-Bench 2.1 | 309 / 445 | **69.44%** |
+| 能力 | 说明 |
+|---|---|
+| PDF 导入 | 逐页抽取文本，SHA-256 变更检测，损坏/加密文件明确报错 |
+| 全文检索 | SQLite FTS5 + 中文分词（NFKC 规范化）+ 双路召回（严格 AND + 宽松 OR） |
+| 受控扩展 | 词形归一、有出处的术语别名、查询级扩展、少数查询的子查询融合 |
+| 证据可追溯 | 返回论文标题、页码、原文片段；高亮只标原文真实位置，绝不编造 |
+| 本地持久化 | SQLite 索引 + 会话文件，重启不丢 |
 
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/terminal-bench-ranking-dark.svg">
-    <source media="(prefers-color-scheme: light)" srcset="assets/terminal-bench-ranking-light.svg">
-    <img src="assets/terminal-bench-ranking-light.svg" alt="Terminal-Bench 2.1 score comparison: mini-harness at 69.44% would place 13th among 18 public entries plus this self-reported run, as of September 4, 2026. This is not an official rank." width="900">
-  </picture>
-</p>
+**边界如实说明**：
+- 检索是**词法匹配**（lexical），不是语义搜索；未解决"主题相关 vs 字面提及"问题。
+- 证据片段会随工具结果进入模型上下文（见下方[隐私边界](#隐私边界)）。
+- 模型必须支持 **OpenAI 兼容的 function calling（工具调用）**，否则无法驱动工具链。
 
-The figure inserts our score into the [public Terminal-Bench 2.1 leaderboard](https://www.tbench.ai/?version=2.1)
-as of **September 4, 2026**; **13th of 19 is an illustrative position, not an official
-rank**. The Terminal-Bench result averages five attempts on each of 89 tasks,
-not pass@5. See [evaluation details, recorded failures, and reproduction limits](BENCHMARKS.md).
+---
 
-## Define a tool with Pydantic
+## Quickstart
 
-A tool combines a Pydantic input model, a Python function, and a `ToolDefinition`.
-After installing and exporting `DEEPSEEK_API_KEY` (see [Get started](#get-started)),
-pass your definitions to the agent to choose which tools it can use:
+### 1. 前置条件
 
-```python
-from pydantic import BaseModel, ConfigDict, Field
+- **Python ≥ 3.12**
+- **[uv](https://docs.astral.sh/uv/)**（推荐的包管理器）
+- 一个**支持 function calling 的 OpenAI 兼容模型服务**（云端或本地均可）
 
-from mini_harness.agent import DeepSeekAgent
-from mini_harness.tool.box import TOOLS, ToolDefinition
+### 2. 克隆并安装
 
-
-class CountWordsInput(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    text: str = Field(min_length=1, description="Text to count words in.")
-
-
-def count_words(args: CountWordsInput) -> str:
-    return str(len(args.text.split()))
-
-
-count_words_tool = ToolDefinition(
-    name="count_words",
-    description="Count whitespace-separated words in text.",
-    parameters=CountWordsInput,
-    function=count_words,
-    risky=False,
-)
-
-agent = DeepSeekAgent([*TOOLS, count_words_tool])
-```
-
-The agent uses `model_json_schema()` to describe each tool to the model.
-Before dispatch, the [tool executor](src/mini_harness/tool/box.py) calls
-`model_validate_json()` to validate its arguments; invalid calls return an error
-for the agent to correct. One definition keeps the schema, validation, and
-execution connected. See the [Pydantic model documentation](https://docs.pydantic.dev/latest/concepts/models/).
-
-## Get started
-
-### 1. Download and install
-
-Install [uv](https://docs.astral.sh/uv/getting-started/installation/) if you do not
-have it, then clone the repository. Python 3.12+ is required; uv can install it.
-
-```sh
-# macOS / Linux — install uv once, then restart your terminal
-curl -LsSf https://astral.sh/uv/install.sh | sh
-```
-
-```sh
-git clone https://github.com/mini-harness/mini-harness.git
-cd mini-harness
-uv python install 3.12
+```bash
+git clone <本仓库地址>
+cd <仓库目录>
 uv sync --locked
 ```
 
-### 2. Connect the agent
+### 3. 配置模型服务
 
-Set your [DeepSeek API key](https://platform.deepseek.com/api_keys) in the shell,
-then launch the TUI. No `.env` file is needed.
-
-```sh
-export DEEPSEEK_API_KEY="your-api-key"
-uv run tui.py
+```bash
+cp .env.example .env
+# 用编辑器打开 .env，填入你的模型服务配置
 ```
 
-`Enter` sends a message · `Ctrl+N` starts a session · `F2` opens sessions ·
-`Ctrl+E` expands tools · `Ctrl+C` cancels · `Ctrl+Q` quits.
+配置有两种典型形态——**云端 API** 与 **本地模型服务**，详见 `.env.example` 内注释。
 
-The agent reads the project workspace; local file tools write to `sandbox/`.
-The TUI asks before shell, sandbox, or subagent calls. Sessions stay in `.local/` and are
-ignored by Git. Cancelling a task keeps file edits already completed.
+配置变量的真实名称与优先级（以源码 `src/mini_harness/config.py` 为准）：
 
-To run generated code with `run_sandbox`, install and start
-[Docker](https://docs.docker.com/get-started/get-docker/), then pull its Python image once:
+| 环境变量 | 作用 | 必需性 |
+|---|---|---|
+| `MINI_HARNESS_PROVIDER` | `openai` / `deepseek` / `local` 之一；不设置时按 `MINI_HARNESS_MODEL` 前缀推断 | 建议显式设置 |
+| `MINI_HARNESS_MODEL` | 模型名；可用 `provider/model` 形式 | 是 |
+| `MINI_HARNESS_API_KEY` | API 密钥（优先读取） | 视服务而定 |
+| `{PROVIDER}_API_KEY` | 备选密钥变量名（如 `DEEPSEEK_API_KEY`、`LOCAL_API_KEY`、`OPENAI_API_KEY`） | 二选一 |
+| `MINI_HARNESS_API_KEY_ENV` | 自定义密钥变量名 | 可选 |
+| `OPENAI_BASE_URL` | `provider=openai` 时的 API 地址 | 按需 |
+| `LOCAL_BASE_URL` | `provider=local` 时的 API 地址（默认 `http://127.0.0.1:8000/v1`） | 按需 |
+| `MINI_HARNESS_WORK_SPACE` | 工作目录（决定数据位置，见下） | 可选 |
 
-```sh
-docker pull python:3.12-slim
+`.env` 由 `python-dotenv` 自动加载（从当前目录向上查找）。**密钥不会写入日志或
+telemetry**，请勿将 `.env` 提交到 Git（`.gitignore` 已覆盖）。
+
+### 4. 准备论文
+
+把 PDF 放进**工作目录**下的 `papers/`（默认工作目录是启动 `paperpilot` 时所在的目录）：
+
+```bash
+mkdir -p papers
+cp /path/to/your/*.pdf papers/
 ```
 
-`run_sandbox` is a Pydantic-defined tool accepting `command` and
-`timeout_seconds` (1–300, default 30). It runs in a disposable Python 3.12
-container with networking disabled, a read-only system, and limits of one CPU,
-256 MB RAM, and 64 processes. Only `sandbox/` is mounted at `/workspace`; changes
-there persist. For example, `{"command": "python hello.py"}` runs
-`sandbox/hello.py`. No host environment variables are forwarded into the container.
-The host `run_bash` tool remains available and is not isolated.
+### 5. 跑通一次完整流程
 
-For the plain terminal interface:
+先看帮助：
 
-```sh
-uv run --locked mini-harness
+```bash
+uv run paperpilot --help
 ```
 
-## Benchmark adapters
+执行一个真实研究任务（Agent 会自主调用导入 → 检索 → 读原文 → 作答）：
 
-Run these commands from the repository root after installation. The adapters in
-[`bench/`](bench/) connect mini-harness to Harbor and SWE-bench cloud scoring.
-The examples use OpenAI; for DeepSeek, export `DEEPSEEK_API_KEY` and change the
-model to `deepseek/deepseek-v4-flash`.
-
-### Harbor
-
-With Docker running, evaluate one SWE-bench Verified task using the
-[Harbor adapter](bench/adapter.py):
-
-```sh
-export OPENAI_API_KEY="your-openai-api-key"
-PYTHONPATH=. uv run --with "harbor==0.20.0" harbor run \
-  -d swebench-verified \
-  --agent bench.adapter:MiniHarnessAgent \
-  --model openai/gpt-4.1 --env docker --n-tasks 1 -n 1
+```bash
+uv run paperpilot --task \
+  "import the papers dir, then find evidence about low-rank updates and quote the exact source"
 ```
 
-Harbor runs the agent and verifier, saving results and ATIF trajectories under
-`jobs/`. Remove `--n-tasks 1` to evaluate the full dataset; `-n` controls concurrency.
-See [Harbor's custom-agent guide](https://www.harborframework.com/docs/agents).
+预期行为：Agent 先调用 `import_papers` 导入 `papers/`，再用 `search_papers` 检索，
+必要时用 `read_paper_page` 读取原文，最后给出**带页码的引用**。若无命中，会如实说明，
+不会编造引用。
 
-### SWE-bench cloud scoring with sb-cli
+需要审计工具调用记录时，可追加 telemetry 输出：
 
-The [cloud entry point](bench/sb_cli.py) uses Modal to run the agent, exports its
-patches, then submits them to sb-cli for scoring. Set `OPENAI_API_KEY` as above,
-obtain a [verified sb-cli API key](https://www.swebench.com/sb-cli/authentication/),
-and sign in to [Modal](https://modal.com/docs/cli/latest/setup):
-
-```sh
-export SWEBENCH_API_KEY="your-verified-sb-cli-api-key"
-uv run --with-requirements bench/requirements-sb-cli.txt modal setup
-uv run --with-requirements bench/requirements-sb-cli.txt \
-  python -m bench.sb_cli run \
-  --job-dir jobs/sb-cli-smoke --run-id mini-harness-smoke \
-  --model openai/gpt-4.1 --n-tasks 1
+```bash
+uv run paperpilot --task "..." --telemetry-out run.json
 ```
 
-Add `--dry-run` to the final command to preview without launching a job. Replace
-`--n-tasks 1` with `--all` for all 500 tasks, using a new job directory and run ID
-for each run. Predictions are saved to `jobs/sb-cli-smoke/predictions.json` and
-reports to `jobs/sb-cli-smoke/sb-cli-reports/`. The `generate`, `export`, and
-`submit` subcommands also let you run each stage separately.
+不带 `--task` 时进入交互模式，逐条输入研究问题。
+
+### 6. 直接使用工具（可选）
+
+三个工具也可以作为 Python 函数直接导入调用，用于调试或批量导入。它们不是 `paperpilot` CLI 子命令：
+
+```python
+from paperpilot.tools import (
+    import_papers,
+    search_papers,
+    read_paper_page,
+)
+```
+
+| 工具 | 作用 |
+|---|---|
+| `import_papers` | 导入目录（或单个 PDF）到本地索引 |
+| `search_papers` | 关键词检索，返回 paper_id、页码、原文片段 |
+| `read_paper_page` | 按 paper_id + 页码读取整页原文 |
+
+---
+
+## 数据存放位置
+
+| 数据 | 默认位置 |
+|---|---|
+| 索引数据库 | `<工作目录>/sandbox/paperpilot/index.db` |
+| 会话文件 | `<工作目录>/sandbox/paperpilot/session.json` |
+| 论文 PDF | `<工作目录>/papers/`（按工作目录相对路径引用） |
+
+**工作目录**默认是启动命令时的当前目录；可用 `MINI_HARNESS_WORK_SPACE` 指定：
+
+```bash
+MINI_HARNESS_WORK_SPACE=/path/to/research-space uv run paperpilot --task "..."
+```
+
+> **注意**：数据跟着工作目录走。换目录启动会得到不同的索引库。建议为每个研究项目
+> 固定一个工作目录，并在该目录下运行 `paperpilot`。
+
+`.gitignore` 已覆盖 `.env`、`sandbox/`、`/papers/`、`session.json`，本地数据不会被误提交。
+
+---
+
+## 隐私边界
+
+**本地保存论文 ≠ 推理全在本地。**
+
+- **完全本地的部分**：PDF 解析、全文索引、检索排序——全程在你的机器上，零外发。
+- **会外发的部分**：当你使用**云端模型**时，下列内容会通过 API 发送给模型服务：
+  1. 系统提示词（角色与工具说明）
+  2. 你输入的研究问题
+  3. **工具返回结果**——包括论文标题、页码，以及 `search_papers` 的原文片段和
+     `read_paper_page` 的整页正文
+  4. 上述内容构成的对话历史
+
+对隐私敏感的论文，请配置**本地模型服务**（vLLM / Ollama 的 OpenAI 兼容模式等），
+使推理也留在本机。
+
+---
+
+## 常见问题
+
+**Q: 模型没有调用工具，直接编造了答案？**
+该模型可能未正确支持 function calling。换用支持工具调用的模型/服务，并确认
+服务端已开启 OpenAI 兼容的 tool_calls 格式。
+
+**Q: 中文论文检索不到？**
+PaperPilot 使用 CJK 感知的分词与 NFKC 规范化（兼容汉字可正常检索）。若仍漏检，
+可尝试更简洁的关键词组合——检索是词法匹配，不理解同义改写。
+
+**Q: 如何更换模型服务？**
+改 `.env` 中的 `MINI_HARNESS_PROVIDER` / `MINI_HARNESS_MODEL` 与对应地址、密钥即可，
+无需改动代码。
+
+---
+
+## 开发
+
+```bash
+uv run python -m unittest discover -s tests -t .   # 测试
+uv run ruff check src tests                        # 静态检查
+uv lock --check                                    # 锁文件一致性
+```
+
+代码结构见 `src/paperpilot/`（论文工具）与 `src/mini_harness/`（Agent harness）。

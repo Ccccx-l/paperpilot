@@ -3,9 +3,9 @@ requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [project]
-name = "mini-harness"
+name = "paperpilot"
 version = "0.1.0"
-description = "A minimal Python coding-agent harness"
+description = "PaperPilot: a local research-paper agent with traceable PDF evidence (built on mini-harness)"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -16,8 +16,7 @@ dependencies = [
     "pypdf==6.21.2",
 ]
 
-[project.urls]
-Repository = "https://github.com/mini-harness/mini-harness"
+# Repository URL 待项目负责人确认后补充；不猜测正式仓库地址。
 
 [project.scripts]
 mini-harness = "mini_harness.main:main"
