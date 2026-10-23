@@ -14,6 +14,7 @@ from paperpilot.search import (
     BODY_WEIGHT,
     MIN_LOOSE_TERM_HITS,
     TITLE_WEIGHT,
+    QUERY_EXPANSIONS,
     TERM_ALIASES,
     build_loose_match,
     build_match_query,
@@ -22,7 +23,9 @@ from paperpilot.search import (
     concept_groups,
     discriminative_terms,
     evidence_terms,
+    expansion_tokens,
     inflection_family,
+    is_index_token,
     min_term_hits,
     search,
     term_coverage,
@@ -633,6 +636,163 @@ class TestStatusAfterExpansion(SearchTestBase):
         hits = {r.title: r for r in search(self.store, 'fine')}
         self.assertEqual(hits['连字'].status, 'body_matched_no_highlight')
         self.assertEqual(hits['连字'].snippet, '')
+
+
+class TestQueryExpansions(unittest.TestCase):
+    """Query-level controlled expansion: granularity, scope, provenance."""
+
+    def test_expansions_exist_only_for_validated_queries(self):
+        self.assertEqual(set(QUERY_EXPANSIONS), {'统计语言模型', 'Transformer 注意力机制'})
+        self.assertEqual(
+            expansion_tokens('统计语言模型'),
+            ['转移', '概率', '马尔', '可夫', 'NLM', 'NLMs'],
+        )
+        self.assertEqual(
+            expansion_tokens('Transformer 注意力机制'),
+            ['遮罩', '掩码', '快速'],
+        )
+        self.assertEqual(expansion_tokens('神经语言模型'), [], 'other queries untouched')
+        self.assertEqual(expansion_tokens('量子引力'), [])
+
+    def test_every_token_is_a_real_index_token(self):
+        for query, entries in QUERY_EXPANSIONS.items():
+            for token, kind, source in entries:
+                with self.subTest(query=query, token=token):
+                    self.assertTrue(is_index_token(token), f'{token!r} not an index token')
+                    self.assertIn(kind, ('synonym', 'context'))
+                    self.assertTrue(source.strip(), 'source citation required')
+
+    def test_multi_token_strings_are_not_index_tokens(self):
+        # n-gram 被 '-' 切成 n + gram；中文整串不是索引 token
+        self.assertFalse(is_index_token('n-gram'))
+        self.assertFalse(is_index_token('转移概率'))
+        self.assertFalse(is_index_token('快速注意力'))
+        self.assertTrue(is_index_token('gram'), 'real alnum run is valid')
+        self.assertTrue(is_index_token('转移'), 'CJK bigram is valid')
+
+    def test_invalid_expansion_entry_raises_not_silently_queried(self):
+        from paperpilot import search as search_mod
+        original = search_mod.QUERY_EXPANSIONS
+        try:
+            search_mod.QUERY_EXPANSIONS = {
+                'x y': (('n-gram', 'context', 'test source'),),
+            }
+            with self.assertRaises(ValueError):
+                search_mod.expansion_tokens('x y')
+            search_mod.QUERY_EXPANSIONS = {
+                'x y': (('转移', 'nonsense-kind', 'test source'),),
+            }
+            with self.assertRaises(ValueError):
+                search_mod.expansion_tokens('x y')
+        finally:
+            search_mod.QUERY_EXPANSIONS = original
+
+    def test_context_words_are_not_registered_as_synonyms(self):
+        # NLM 是「统计语言模型」的发展史上下文，不得成为同义词（concept 组）
+        for token, kind, _source in QUERY_EXPANSIONS['统计语言模型']:
+            if token in ('NLM', 'NLMs'):
+                self.assertEqual(kind, 'context')
+        groups = concept_groups('统计语言模型')
+        flat = [t for g in groups for t in g]
+        self.assertNotIn('NLM', flat, 'expansion must not enter concept_groups')
+        self.assertNotIn('转移', flat)
+
+    def test_expansion_tokens_do_not_count_towards_concept_coverage(self):
+        groups = concept_groups('统计语言模型')
+        required = min_term_hits(len(groups))
+        # 仅扩展词命中 -> 原查询概念覆盖 0，绝不准入
+        self.assertEqual(
+            concept_coverage({'nlms', '转移', '概率', '马尔'}, groups), 0,
+        )
+        self.assertLess(
+            concept_coverage({'nlms', '转移'}, groups), required,
+            'expansion-only hit must not pass admission',
+        )
+
+    def test_expansion_does_not_change_admission_threshold(self):
+        for query in QUERY_EXPANSIONS:
+            with self.subTest(query=query):
+                groups = concept_groups(query)
+                self.assertEqual(min_term_hits(len(groups)), MIN_LOOSE_TERM_HITS)
+                # 扩展项数量不影响阈值
+                self.assertEqual(len(groups), len(concept_groups(query)))
+
+
+class TestQueryExpansionRetrieval(SearchTestBase):
+    """End-to-end: expansion widens recall/scoring, never the admission bar."""
+
+    def setUp(self):
+        super().setUp()
+        # 模仿真实 p.3：原查询概念（语言/言模/模型）命中 + 扩展词（NLM/转移概率）
+        self._add('nlm_ctx.pdf', '发展史页', [
+            '由于需要估计指数级数量的转移概率,NLM 影响语言模型的发展。',
+        ])
+        # 纯扩展词页：原查询概念覆盖不足，必须被拒
+        self._add('exp_only.pdf', '纯扩展页', [
+            'NLM 与转移概率的其他讨论。',
+        ])
+        self._add('unrelated.pdf', '无关页', ['gardening tips for spring.'])
+
+    def test_expansion_scoped_to_its_query_only(self):
+        q5 = [r.title for r in search(self.store, '统计语言模型')]
+        self.assertIn('发展史页', q5, 'Q5 expansion must admit a real body hit')
+        # 同一批扩展对无关查询不生效
+        self.assertNotIn('发展史页', [r.title for r in search(self.store, '神经网络')])
+        self.assertEqual(search(self.store, '遮罩'), [])
+
+    def test_expansion_only_page_is_refused(self):
+        # 「纯扩展页」只有 NLM/转移（扩展词），原查询概念覆盖=0
+        titles = [r.title for r in search(self.store, '统计语言模型')]
+        self.assertNotIn('纯扩展页', titles,
+                         'expansion tokens alone must not pass admission')
+
+    def test_original_query_still_retrieves_and_ranks(self):
+        self._add('exact.pdf', '精确页', ['统计语言模型是常见基线。'])
+        results = search(self.store, '统计语言模型')
+        titles = [r.title for r in results]
+        self.assertIn('精确页', titles, 'original query must keep working')
+        # 严格 AND 命中的页仍应排在前面
+        self.assertEqual(results[0].title, '精确页')
+
+    def test_strict_and_semantics_unchanged(self):
+        self._add('exact.pdf', '精确页', ['统计语言模型是常见基线。'])
+        self._add('slm.pdf', '统计方法', ['本文采用基于统计学习方法的语言模型建模。'])
+        expr = build_match_query('统计语言模型')
+        self.assertIn('"统计"', expr)
+        self.assertIn('"计语"', expr)
+        # 严格路径仍是全 AND：缺跨界 bigram 的页面不进严格结果
+        titles = [r.title for r in search(self.store, '统计语言模型')]
+        self.assertIn('统计方法', titles, 'loose path still recalls')
+        self.assertIn('精确页', titles)
+
+    def test_expansion_never_fakes_body_highlights(self):
+        import re
+        self._add('exact.pdf', '精确页', ['统计语言模型是常见基线。'])
+        for r in search(self.store, '统计语言模型'):
+            body = self.store.page_by_id(r.page_id)['body']
+            for m in re.finditer(r'\[(.*?)\]', r.snippet):
+                self.assertIn(m.group(1), body, 'fabricated highlight')
+            # 扩展词不进 evidence_terms，不得被高亮
+            self.assertNotIn('[NLM]', r.snippet)
+            self.assertNotIn('[转移]', r.snippet)
+
+    def test_negative_controls_stay_empty(self):
+        self.assertEqual(search(self.store, 'quantum computing applications'), [])
+        self.assertEqual(search(self.store, '量子引力 黑洞'), [])
+
+    def test_probe_queries_untouched_by_expansion(self):
+        # Q6/Q9 不在扩展表中，行为不受影响
+        self._add('llm.pdf', '大模型页', ['大语言模型(LLM)的进展。'])
+        q6 = [r.title for r in search(self.store, '大语言模型')]
+        self.assertIn('大模型页', q6)
+        self.assertEqual(search(self.store, '低秩 适配'), [])
+
+    def test_unrelated_query_gets_no_extra_hits(self):
+        before = [r.title for r in search(self.store, 'gardening')]
+        self._add('garden2.pdf', '园艺页', ['gardening tips for spring planting.'])
+        after = [r.title for r in search(self.store, 'gardening')]
+        self.assertEqual(set(after) - set(before), {'园艺页'},
+                         'only real matches, no expansion leakage')
 
 
 if __name__ == '__main__':

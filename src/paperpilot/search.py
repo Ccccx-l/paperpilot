@@ -102,6 +102,42 @@ TERM_ALIASES: dict[str, tuple[str, ...]] = {
     '大语言模型': ('LLM',),
 }
 
+# Query-level controlled expansion -- deliberately NOT merged into
+# TERM_ALIASES. These extra index tokens widen the loose MATCH OR and
+# therefore BM25 scoring for ONE specific query. They never enter
+# concept_coverage(), never move min_term_hits(), and can never admit a
+# page whose original-query concepts fall below the threshold.
+#
+# Each entry is (token, kind, source) and must be a real index token
+# (see is_index_token): a CJK bigram or a whole Latin/digit run. Multi-
+# token strings such as 'n-gram' or '快速注意力' are REJECTED -- the
+# index stores unigrams+bigrams for CJK and one token per alnum run.
+#
+# kind is 'synonym' (near-equivalent wording) or 'context' (related
+# context word that co-occurs with the concept but is NOT a synonym).
+# Only tokens validated in the step-3-4 B' isolation experiments are
+# listed; do not add entries without corpus evidence and an experiment.
+QUERY_EXPANSIONS: dict[str, tuple[tuple[str, str, str], ...]] = {
+    '统计语言模型': (
+        # p.3 states the limitation of statistical LMs via 转移概率, and
+        # p.3/p.4 discuss the successor NLM -- development-history context,
+        # NOT synonyms of 统计语言模型.
+        ('转移', 'context', 'AI报告 p.3「由于需要估计指数级数量的转移概率」'),
+        ('概率', 'context', 'AI报告 p.3「由于需要估计指数级数量的转移概率」'),
+        ('马尔', 'context', 'AI报告 p.2「基于马尔可夫假设建立单词预测模型」'),
+        ('可夫', 'context', 'AI报告 p.2「基于马尔可夫假设建立单词预测模型」'),
+        ('NLM', 'context', 'AI报告 p.3「神经语言模型(Neural Language Model,简称NLM)」'),
+        ('NLMs', 'context', 'AI报告 p.4「NLMs专注于学习与任务无关的表示」'),
+    ),
+    'Transformer 注意力机制': (
+        # p.17/p.22 phrase attention-mechanism content without the
+        # continuous form 注意力机制 -- these are the wording variants.
+        ('遮罩', 'context', 'AI报告 p.17「因果解码器架构采用单向注意力遮罩」'),
+        ('掩码', 'context', 'AI报告 p.17「修改了因果解码器的掩码机制」'),
+        ('快速', 'context', 'AI报告 p.22「快速注意力…优化注意力模块」'),
+    ),
+}
+
 STATUS_HIGHLIGHTED = 'highlighted'
 STATUS_BODY_NO_HIGHLIGHT = 'body_matched_no_highlight'
 STATUS_TITLE_ONLY = 'title_only'
@@ -271,6 +307,46 @@ def discriminative_terms(query: str) -> list[str]:
                 seen.add(key)
                 unique.append(term)
     return unique
+
+
+def is_index_token(token: str) -> bool:
+    """True iff ``token`` is exactly one token produced by segment_tokens().
+
+    The index stores CJK unigrams+bigrams and whole Latin/digit runs, so
+    '转移', '遮罩' and 'NLM' are valid while '转移概率' (4-char run) and
+    'n-gram' (two alnum runs split by '-') are not. Expansion entries
+    that fail this check are refused loudly, never silently queried as
+    a phrase.
+    """
+    return bool(token) and token in set(segment_tokens(token))
+
+
+def expansion_tokens(query: str) -> list[str]:
+    """Query-level expansion tokens for the loose MATCH OR only.
+
+    These widen candidate recall and BM25 scoring. They are deliberately
+    absent from concept_coverage(): a page matching ONLY expansion
+    tokens still fails admission unless the ORIGINAL query concepts
+    reach min_term_hits(). Invalid entries (wrong granularity) raise
+    ValueError at call time so a bad config cannot ship silently.
+    """
+    key = unicodedata.normalize('NFKC', query)
+    entries = QUERY_EXPANSIONS.get(key, ())
+    tokens: list[str] = []
+    seen = set()
+    for token, kind, source in entries:
+        if kind not in ('synonym', 'context'):
+            raise ValueError(f'expansion kind must be synonym/context: {token!r}')
+        if not is_index_token(token):
+            raise ValueError(
+                f'expansion token {token!r} is not a single index token '
+                f'(source: {source})'
+            )
+        fold = token.casefold()
+        if fold not in seen:
+            seen.add(fold)
+            tokens.append(token)
+    return tokens
 
 
 def build_loose_match(terms: list[str]) -> str:
@@ -486,6 +562,13 @@ def search(store: PaperStore, query: str, *, top_k: int = DEFAULT_TOP_K) -> list
     terms (evidence_terms) at real spans in pages.body -- an expanded
     form can pull a page in, but never paints a highlight.
 
+    Query-level expansion (QUERY_EXPANSIONS) joins the loose MATCH OR to
+    widen recall and BM25 scoring for one specific query. Those tokens
+    are NOT concept forms: they never enter concept_coverage() and never
+    move min_term_hits(). A page that only matches expansion tokens still
+    needs the original query's concepts to clear the same threshold --
+    expansion widens the net, it does not lower the bar.
+
     Status correction: when the original query strings cannot be located
     in pages.body (locate_snippet says title_only) but the indexed body
     still satisfies the SAME concept-coverage rule as the loose pass, the
@@ -504,7 +587,10 @@ def search(store: PaperStore, query: str, *, top_k: int = DEFAULT_TOP_K) -> list
         return []
     terms = evidence_terms(query)
     groups = concept_groups(query)
-    loose_expr = build_loose_match(discriminative_terms(query))
+    # Expansion tokens widen the OR / BM25 only; admission and status
+    # correction below still use concept_coverage(groups) alone.
+    loose_terms = discriminative_terms(query) + expansion_tokens(query)
+    loose_expr = build_loose_match(loose_terms)
     required = min_term_hits(len(groups))
 
     candidates: dict[tuple[int, int], dict] = {}
