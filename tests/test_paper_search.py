@@ -12,11 +12,16 @@ from mini_harness.config import CONFIG
 from paperpilot.pdf_import import PaperDocument, PageText
 from paperpilot.search import (
     BODY_WEIGHT,
+    MIN_LOOSE_TERM_HITS,
     TITLE_WEIGHT,
+    build_loose_match,
     build_match_query,
     build_snippet,
+    discriminative_terms,
     evidence_terms,
+    min_term_hits,
     search,
+    term_coverage,
 )
 from paperpilot.store import PaperStore
 
@@ -241,6 +246,110 @@ class TestCompatHanEvidence(unittest.TestCase):
         self.assertEqual(evidence_terms('⼤语⾔模型'), evidence_terms('大语言模型'))
         self.assertIn('大语言模型', evidence_terms('⼤语⾔模型'))
         self.assertNotIn('⼤', evidence_terms('⼤语⾔模型'))
+
+
+class TestLooseTerms(unittest.TestCase):
+    """Loose-pass vocabulary: distinctive only, never bare CJK unigrams."""
+
+    def test_cjk_run_yields_bigrams_not_unigrams(self):
+        terms = discriminative_terms('统计语言模型')
+        self.assertEqual(terms, ['统计', '计语', '语言', '言模', '模型'])
+        self.assertNotIn('统', terms)
+        self.assertNotIn('语', terms)
+
+    def test_latin_words_are_whole_runs(self):
+        self.assertEqual(
+            discriminative_terms('low-rank weight updates'),
+            ['low', 'rank', 'weight', 'updates'],
+        )
+
+    def test_single_char_cjk_query_keeps_its_unigram(self):
+        self.assertEqual(discriminative_terms('量'), ['量'])
+
+    def test_duplicates_removed_order_stable(self):
+        self.assertEqual(discriminative_terms('语言模型 语言'), ['语言', '言模', '模型'])
+
+    def test_threshold_is_two_for_multi_term_queries(self):
+        self.assertEqual(MIN_LOOSE_TERM_HITS, 2)
+        self.assertEqual(min_term_hits(0), 0)
+        self.assertEqual(min_term_hits(1), 1)
+        for count in (2, 3, 5, 8):
+            self.assertEqual(min_term_hits(count), 2)
+
+    def test_coverage_is_token_exact_not_substring(self):
+        self.assertEqual(term_coverage({'weights'}, ['weight']), 0)
+        self.assertEqual(term_coverage({'weight'}, ['weights']), 0)
+        self.assertEqual(term_coverage({'weight', 'weights'}, ['weight', 'weights']), 2)
+        # casefolded membership, same as FTS5 unicode61 folding
+        self.assertEqual(term_coverage({'transformer'}, ['Transformer']), 1)
+
+    def test_loose_match_quotes_every_term(self):
+        self.assertEqual(build_loose_match(['alpha', 'beta']), '"alpha" OR "beta"')
+        self.assertEqual(build_loose_match([]), '')
+        for piece in build_loose_match(['a* NEAR', '"x"']).split(' OR '):
+            self.assertTrue(piece.startswith('"') and piece.endswith('"'))
+
+
+class TestLooseRetrieval(SearchTestBase):
+    """Loose candidates rescue AND misses and compete on score, not arrival order."""
+
+    def setUp(self):
+        super().setUp()
+        # 严格 AND 会因跨词边界 bigram '计语' 缺失而零命中；
+        # 页面实际说的是「统计学习方法的语言模型」。
+        self._add('slm.pdf', '统计方法', ['本文采用基于统计学习方法的语言模型建模。'])
+        self._add('slm_exact.pdf', '语言模型', ['统计语言模型是常见基线模型。'])
+        self._add('noise.pdf', '噪声页', ['这里只提到语言两个字而已。'])
+        self._add('one_word.pdf', '单词页', ['quantum appears once here.'])
+
+    def test_loose_rescues_and_zero_hit_query(self):
+        results = search(self.store, '统计语言模型')
+        titles = [r.title for r in results]
+        self.assertIn('统计方法', titles, 'wording variant must be recalled')
+        self.assertEqual(
+            search(self.store, '统计语言模型', top_k=1)[0].title, '语言模型',
+            'exact phrase page still ranks first',
+        )
+
+    def test_loose_fires_even_when_strict_already_hits(self):
+        # 严格路径已能命中「语言模型」页，但不能因此放弃「统计方法」页
+        strict_only = build_match_query('统计语言模型')
+        self.assertTrue(strict_only)
+        titles = [r.title for r in search(self.store, '统计语言模型')]
+        self.assertIn('语言模型', titles)
+        self.assertIn('统计方法', titles)
+
+    def test_partial_coverage_below_threshold_is_refused(self):
+        # 「噪声页」只覆盖 bigram「语言」= 1 < 2
+        results = search(self.store, '统计语言模型')
+        self.assertNotIn('噪声页', [r.title for r in results])
+
+    def test_loose_page_can_enter_a_full_top_k(self):
+        # 严格结果已填满 top_k=1，宽松页仍不能被钉死在末尾之外
+        results = search(self.store, '统计语言模型', top_k=1)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].title, '语言模型')
+        # top_k=2 时第二席由分数决定，「统计方法」必须在候选池中参与竞争
+        two = search(self.store, '统计语言模型', top_k=2)
+        self.assertEqual([r.title for r in two], ['语言模型', '统计方法'])
+
+    def test_negative_multi_term_query_stays_empty(self):
+        results = search(self.store, 'quantum computing applications')
+        self.assertEqual(results, [], 'coverage 1/3 must not pass min_hits=2')
+
+    def test_single_term_query_still_retrieves(self):
+        results = search(self.store, 'quantum')
+        self.assertEqual([r.title for r in results], ['单词页'])
+
+    def test_merged_results_keep_evidence_status(self):
+        rescued = [r for r in search(self.store, '统计语言模型') if r.title == '统计方法'][0]
+        self.assertEqual(rescued.status, 'highlighted')
+        self.assertIn('[统计', rescued.snippet.replace('[统计学习', '[统计'))
+        self.assertTrue(rescued.snippet, 'rescued page must still carry 原文 evidence')
+
+    def test_scores_are_sorted_ascending(self):
+        scores = [r.score for r in search(self.store, '统计语言模型')]
+        self.assertEqual(scores, sorted(scores))
 
 
 if __name__ == '__main__':
