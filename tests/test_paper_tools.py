@@ -112,6 +112,27 @@ class TestRegistration(ToolsTestBase):
         with self.assertRaises(ValidationError):
             ReadPaperPageInput(paper_id=1, page_no=0)
 
+    def test_search_query_description_matches_implementation(self):
+        """描述必须反映双路检索现状，不得回到「strict AND 长句必不中」的误导措辞。"""
+        desc = SearchPapersInput.model_fields['query'].description
+        self.assertIn('strict AND', desc, 'strict pass still exists')
+        self.assertIn('looser', desc, 'loose recall pass must be mentioned')
+        self.assertIn('expansion', desc, 'controlled expansion must be mentioned')
+        self.assertIn('sub-quer', desc, 'preconfigured sub-query fusion must be mentioned')
+        self.assertIn('read_paper_page', desc, 'verification via original text required')
+        # 禁止重新引入已被否证的绝对化措辞
+        self.assertNotIn('rarely match', desc)
+        self.assertNotIn('Do NOT paste', desc)
+        self.assertNotIn('semantic understanding, ', desc.replace('not semantic understanding', ''))
+        self.assertIn('not semantic understanding', desc,
+                      'must stay explicit that this is lexical, not semantic')
+
+    def test_search_description_does_not_claim_solved_semantics(self):
+        desc = SearchPapersInput.model_fields['query'].description
+        for overclaim in ('semantic search', 'understands meaning', 'topic relevance solved',
+                          'vector', 'embedding', 're-rank'):
+            self.assertNotIn(overclaim, desc.lower())
+
 
 def inspect_signature(func):
     import inspect
@@ -171,8 +192,26 @@ class TestImportTool(ToolsTestBase):
         self.assertIn('no PDF files found', out)
 
     def test_missing_directory(self):
-        with self.assertRaises(FileNotFoundError):
-            import_papers(ImportPapersInput(paper_dir='papers/nope'), cfg=self.cfg)
+        out = import_papers(ImportPapersInput(paper_dir='papers/nope'), cfg=self.cfg)
+        self.assertIn('[not found]', out)
+        self.assertIn('papers/nope', out, 'error must keep the concrete path')
+
+    def test_missing_directory_does_not_raise(self):
+        # 与 search_papers / read_paper_page 一致：缺失路径是可控返回，
+        # 不得让裸 FileNotFoundError 逃逸成通用 EXECUTE_FAILED
+        out = import_papers(ImportPapersInput(paper_dir='nonexistent'), cfg=self.cfg)
+        self.assertIsInstance(out, str)
+        self.assertTrue(out.startswith('[not found]'), out)
+
+    def test_missing_single_file_reports_not_found(self):
+        out = import_papers(ImportPapersInput(paper_dir='papers/ghost.pdf'), cfg=self.cfg)
+        self.assertIn('[not found]', out)
+
+    def test_normal_import_still_works_after_fix(self):
+        self.write_pdf('ok.pdf', ['正常导入内容'])
+        out = import_papers(ImportPapersInput(paper_dir='papers'), cfg=self.cfg)
+        self.assertIn('imported:', out)
+        self.assertIn('1 imported', out)
 
 
 class TestSearchTool(ToolsTestBase):

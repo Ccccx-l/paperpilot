@@ -43,9 +43,15 @@ class SearchPapersInput(BaseModel):
     model_config = ConfigDict(extra='forbid')
     query: str = Field(
         min_length=1,
-        description='2-6 concise keywords (e.g. "LoRA gradient alignment"). Do NOT paste '
-                    'a full natural-language question: terms are combined with strict AND '
-                    'semantics, so long sentences rarely match.',
+        description='Keywords or a short phrase (e.g. "LoRA gradient alignment"). '
+                    'Retrieval runs a strict AND pass plus a looser recall pass with '
+                    'controlled word-form and terminology expansion; a few preconfigured '
+                    'queries additionally issue predefined sub-queries and fuse the '
+                    'results. Prefer concise, distinctive terms -- they rank more '
+                    'reliably -- but a longer phrase is not automatically rejected. '
+                    'This is lexical matching, not semantic understanding: always '
+                    'verify the returned snippet/status against read_paper_page before '
+                    'citing.',
     )
     top_k: int = Field(5, ge=1, le=20, description='Maximum number of evidence results.')
 
@@ -67,7 +73,10 @@ def import_papers(inp: ImportPapersInput, cfg = CONFIG) -> str:
     elif target.is_dir():
         files = sorted(target.glob('*.pdf'))
     else:
-        raise FileNotFoundError(f'[not found]: no such file or directory: {inp.paper_dir}')
+        # Missing path is an expected caller mistake: report it like the
+        # other tools do instead of letting a bare FileNotFoundError
+        # surface as a generic EXECUTE_FAILED. Other faults stay uncaught.
+        return f'[not found]: no such file or directory: {inp.paper_dir}'
     if not files:
         return f'no PDF files found in {inp.paper_dir}'
 
