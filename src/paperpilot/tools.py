@@ -119,9 +119,8 @@ def search_papers(inp: SearchPapersInput, cfg = CONFIG) -> str:
             lines.append(f'   {ev.snippet}')
         elif ev.status == STATUS_BODY_NO_HIGHLIGHT:
             lines.append(
-                '   (body matched; highlight unavailable because text '
-                'normalization changed offsets -- read_paper_page returns the '
-                'original text)'
+                '   (body matched; original query terms could not be located '
+                'for highlighting -- read_paper_page returns the original text)'
             )
         elif ev.status == STATUS_TITLE_ONLY:
             lines.append('   (title matched; no direct match on this page body)')

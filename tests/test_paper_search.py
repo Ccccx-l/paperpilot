@@ -14,11 +14,15 @@ from paperpilot.search import (
     BODY_WEIGHT,
     MIN_LOOSE_TERM_HITS,
     TITLE_WEIGHT,
+    TERM_ALIASES,
     build_loose_match,
     build_match_query,
     build_snippet,
+    concept_coverage,
+    concept_groups,
     discriminative_terms,
     evidence_terms,
+    inflection_family,
     min_term_hits,
     search,
     term_coverage,
@@ -253,14 +257,17 @@ class TestLooseTerms(unittest.TestCase):
 
     def test_cjk_run_yields_bigrams_not_unigrams(self):
         terms = discriminative_terms('统计语言模型')
-        self.assertEqual(terms, ['统计', '计语', '语言', '言模', '模型'])
+        self.assertEqual(
+            terms,
+            ['统计', '计语', '语言', '言模', '模型', 'SLM', 'SLMs'],
+        )
         self.assertNotIn('统', terms)
         self.assertNotIn('语', terms)
 
-    def test_latin_words_are_whole_runs(self):
+    def test_latin_words_are_whole_runs_with_inflections(self):
         self.assertEqual(
             discriminative_terms('low-rank weight updates'),
-            ['low', 'rank', 'weight', 'updates'],
+            ['low', 'lows', 'rank', 'ranks', 'weight', 'weights', 'updates', 'update'],
         )
 
     def test_single_char_cjk_query_keeps_its_unigram(self):
@@ -268,6 +275,10 @@ class TestLooseTerms(unittest.TestCase):
 
     def test_duplicates_removed_order_stable(self):
         self.assertEqual(discriminative_terms('语言模型 语言'), ['语言', '言模', '模型'])
+        self.assertEqual(
+            discriminative_terms('大语言模型 大语'),
+            ['大语', '语言', '言模', '模型', 'LLM', 'LLMs'],
+        )
 
     def test_threshold_is_two_for_multi_term_queries(self):
         self.assertEqual(MIN_LOOSE_TERM_HITS, 2)
@@ -288,6 +299,123 @@ class TestLooseTerms(unittest.TestCase):
         self.assertEqual(build_loose_match([]), '')
         for piece in build_loose_match(['a* NEAR', '"x"']).split(' OR '):
             self.assertTrue(piece.startswith('"') and piece.endswith('"'))
+
+
+class TestInflectionFamily(unittest.TestCase):
+    """Controlled English word-form variants; no broad suffix truncation."""
+
+    def test_plural_s_is_bilateral(self):
+        self.assertEqual(inflection_family('updates'), ('updates', 'update'))
+        self.assertEqual(inflection_family('update'), ('update', 'updates'))
+        self.assertEqual(inflection_family('weights'), ('weights', 'weight'))
+
+    def test_abbreviations_keep_their_case_when_pluralised(self):
+        self.assertEqual(inflection_family('NLM'), ('NLM', 'NLMs'))
+        self.assertEqual(inflection_family('SLM'), ('SLM', 'SLMs'))
+
+    def test_ss_final_words_get_no_bogus_stem(self):
+        self.assertEqual(inflection_family('class'), ('class',))
+        self.assertNotIn('clas', inflection_family('class'))
+
+    def test_irregular_freeze_family_is_whole_group(self):
+        expected = {'freeze', 'freezes', 'froze', 'frozen', 'freezing'}
+        for form in expected:
+            self.assertEqual(set(inflection_family(form)), expected, form)
+
+    def test_no_ed_or_ing_stripping(self):
+        # '-ed'/'-ing' truncation would invent junk stems ('used' -> 'us');
+        # only +/-s and the irregular table are allowed.
+        self.assertEqual(inflection_family('used'), ('used', 'useds'))
+        self.assertEqual(inflection_family('making'), ('making', 'makings'))
+
+    def test_empty_and_blank_are_empty(self):
+        self.assertEqual(inflection_family(''), ())
+        self.assertEqual(inflection_family('   '), ())
+
+
+class TestConceptGroups(unittest.TestCase):
+    """One concept == one coverage unit, however many surface forms."""
+
+    def test_cjk_bigrams_are_independent_concepts(self):
+        groups = concept_groups('统计语言模型')
+        self.assertEqual(groups[:5], [('统计',), ('计语',), ('语言',), ('言模',), ('模型',)])
+
+    def test_attested_alias_adds_one_extra_concept(self):
+        groups = concept_groups('神经语言模型')
+        self.assertEqual(len(groups), 6, '5 bigrams + 1 alias concept')
+        self.assertEqual(groups[-1], ('NLM', 'NLMs'))
+        self.assertIn('神经语言模型', TERM_ALIASES)
+
+    def test_aliases_are_only_attested_terms(self):
+        # 无文档定义句的词不得进入术语表
+        self.assertEqual(concept_groups('量子引力'), [('量子',), ('子引',), ('引力',)])
+        for key in TERM_ALIASES:
+            self.assertGreaterEqual(len(key), 2)
+
+    def test_variants_of_one_concept_count_once(self):
+        groups = [('updates', 'update'), ('weight', 'weights')]
+        # 两个概念的所有变体都命中 -> 仍只计 2
+        page = {'updates', 'update', 'weight', 'weights'}
+        self.assertEqual(concept_coverage(page, groups), 2)
+        # 只命中同一概念的两个变体 -> 只计 1
+        self.assertEqual(concept_coverage({'updates', 'update'}, groups), 1)
+
+    def test_expansion_does_not_change_threshold_semantics(self):
+        """Concept count -- not the expanded term count -- drives admission.
+
+        Replaces a tautology (plain and expanded were the same call).
+        Each assertion below is sensitive to the wrong behaviour:
+        counting surface forms instead of concepts would inflate
+        coverage, and deriving the threshold from the flat term list
+        would raise a one-concept query's bar from 1 to 2.
+        """
+        groups = concept_groups('frozen updates')
+        flat = discriminative_terms('frozen updates')
+        # 2 independent concepts, 7 surface forms after expansion
+        self.assertEqual(len(groups), 2)
+        self.assertGreater(len(flat), len(groups), 'variants must outnumber concepts')
+
+        # every variant of BOTH concepts on one page -> still only 2
+        self.assertEqual(concept_coverage({t.casefold() for t in flat}, groups), 2)
+
+        # five variants of the SAME concept -> still only 1
+        self.assertEqual(
+            concept_coverage(
+                {'freeze', 'freezes', 'froze', 'frozen', 'freezing'}, groups
+            ),
+            1,
+        )
+
+        # threshold comes from the concept count (2 -> MIN_LOOSE_TERM_HITS),
+        # not from len(flat); a flat-count threshold would also break the
+        # one-concept case below.
+        self.assertEqual(min_term_hits(len(groups)), MIN_LOOSE_TERM_HITS)
+        single = concept_groups('frozen')
+        self.assertEqual(len(single), 1)
+        self.assertGreater(len(discriminative_terms('frozen')), len(single))
+        self.assertEqual(
+            min_term_hits(len(single)), 1,
+            'one-concept query keeps a threshold of 1 even after expansion '
+            'to %d surface forms' % len(discriminative_terms('frozen')),
+        )
+
+    def test_adding_variants_does_not_add_concepts(self):
+        # same two concepts, with and without inflection partners
+        bare = [('updates',), ('weight',)]
+        with_forms = [('updates', 'update'), ('weight', 'weights')]
+        self.assertEqual(len(bare), len(with_forms), 'variant count != concept count')
+        page = {'update', 'updates', 'weight', 'weights'}
+        self.assertEqual(concept_coverage(page, bare), 2)
+        self.assertEqual(concept_coverage(page, with_forms), 2)
+        self.assertEqual(min_term_hits(len(bare)), min_term_hits(len(with_forms)))
+        # one concept, both its variants present -> one hit, not two
+        self.assertEqual(concept_coverage({'updates', 'update'}, with_forms), 1)
+
+    def test_concept_coverage_requires_any_variant(self):
+        groups = concept_groups('frozen')
+        self.assertEqual(concept_coverage({'freezes'}, groups), 1)
+        self.assertEqual(concept_coverage({'frozen'}, groups), 1)
+        self.assertEqual(concept_coverage({'weight'}, groups), 0)
 
 
 class TestLooseRetrieval(SearchTestBase):
@@ -350,6 +478,161 @@ class TestLooseRetrieval(SearchTestBase):
     def test_scores_are_sorted_ascending(self):
         scores = [r.score for r in search(self.store, '统计语言模型')]
         self.assertEqual(scores, sorted(scores))
+
+
+class TestQueryTimeExpansion(SearchTestBase):
+    """Inflection + attested aliases widen recall without faking evidence."""
+
+    def setUp(self):
+        super().setUp()
+        self._add('sgd.pdf', '梯度更新', ['we apply the gradient update to weight matrices.'])
+        self._add('freeze.pdf', '参数冻结', ['this freezes the pre-trained weights.'])
+        self._add('nlm.pdf', '神经模型史', ['NLMs learn task-independent representations.'])
+        self._add('unrelated.pdf', '无关页', ['quantum computing applications only.'])
+
+    def test_plural_query_reaches_singular_page(self):
+        titles = [r.title for r in search(self.store, 'gradient update')]
+        self.assertIn('梯度更新', titles)
+        titles = [r.title for r in search(self.store, 'gradient updates')]
+        self.assertIn('梯度更新', titles, 'plural query must reach singular text')
+
+    def test_irregular_form_query_reaches_freezes_page(self):
+        for q in ('pre-trained weights frozen', 'weights freezes'):
+            with self.subTest(query=q):
+                self.assertIn('参数冻结', [r.title for r in search(self.store, q)])
+
+    def test_abbreviation_page_reachable_via_attested_alias(self):
+        # 查询用中文全称；页面像 AI报告 p.4 那样以缩写为主、少量中文上下文
+        self._add('nlm_ctx.pdf', '缩写页', ['NLMs learn representations of 语言模型 history.'])
+        titles = [r.title for r in search(self.store, '神经语言模型')]
+        self.assertIn('缩写页', titles, 'attested alias NLM must admit the page')
+        # 纯缩写页只覆盖 1 个概念，仍应被 min_hits=2 拒绝（精度底线）
+        self.assertNotIn('神经模型史', titles)
+
+    def test_pure_abbreviation_page_still_needs_two_concepts(self):
+        results = search(self.store, '神经语言模型')
+        self.assertNotIn('神经模型史', [r.title for r in results],
+                         'alias-only coverage = 1 concept must not pass alone')
+
+    def test_expansion_does_not_fake_body_evidence(self):
+        # 扩展词只负责召回；evidence_terms 仍用原始查询串
+        self.assertNotIn('NLMs', evidence_terms('神经语言模型'))
+        self.assertNotIn('update', evidence_terms('weight'))
+        hit = [r for r in search(self.store, 'gradient updates') if r.title == '梯度更新'][0]
+        # 页面含 'update'，但查询词是 'updates' -> 不得高亮成 'updates'
+        self.assertNotIn('[updates]', hit.snippet)
+
+    def test_negative_query_still_refused_despite_expansion(self):
+        # 语料中不存在的主题：扩展不得把无关内容变成命中
+        self.assertEqual(search(self.store, 'dark matter black hole'), [])
+        self.assertEqual(search(self.store, 'quantum gravity singularity'), [])
+
+    def test_expansion_cannot_widen_injection(self):
+        harmless = {r.title for r in search(self.store, 'gradient update')}
+        injected = {r.title for r in search(self.store, 'gradient update" OR "quantum')}
+        self.assertLessEqual(injected, harmless | {'无关页'})
+        self.assertNotIn('无关页', injected)
+
+
+class TestAdmissionCountsConcepts(SearchTestBase):
+    """Candidate admission: one hit per concept, however many word forms."""
+
+    QUERY = 'frozen updates'   # 2 concepts: freeze-family + updates/update
+
+    def setUp(self):
+        super().setUp()
+        # 反例：同一概念(freeze 族)的两个变体，缺第二概念
+        self._add('one_concept.pdf', '单概念页', [
+            'the freezes were frozen again yesterday.',
+        ])
+        # 正例：两个概念各命中一个变体
+        self._add('two_concepts.pdf', '双概念页', [
+            'this freezes the gradient update during training.',
+        ])
+
+    def test_two_forms_of_one_concept_do_not_pass_admission(self):
+        # 若按词项计数，'freezes'+'frozen' = 2 会误准入；
+        # 按概念计数 freeze 族 = 1 < 2，必须拒绝
+        titles = [r.title for r in search(self.store, self.QUERY)]
+        self.assertNotIn('单概念页', titles,
+                         'two word forms of ONE concept must not pass min_hits=2')
+
+    def test_one_form_per_concept_passes_admission(self):
+        titles = [r.title for r in search(self.store, self.QUERY)]
+        self.assertIn('双概念页', titles,
+                      'one form in each of two concepts must pass min_hits=2')
+
+    def test_single_concept_query_still_admits_one_form(self):
+        # 单概念查询阈值为 1：只命中 freezes 也必须准入
+        self._add('solo.pdf', '孤立页', ['the sample freezes during storage.'])
+        titles = [r.title for r in search(self.store, 'frozen')]
+        self.assertIn('孤立页', titles,
+                      'one concept with one variant must pass its own threshold')
+
+
+class TestStatusAfterExpansion(SearchTestBase):
+    """Status must describe the body, never the pass that recalled the page."""
+
+    def setUp(self):
+        super().setUp()
+        # 正文只含扩展变体（freeszes / update），原始查询词 frozen / updates 均无子串
+        self._add('via_forms.pdf', '词形页', [
+            'this freezes the gradient update during training.',
+        ])
+        # 真正的标题命中：正文与查询无关
+        self._add('title_hit.pdf', 'frozen updates', [
+            'entirely unrelated body text about gardening.',
+        ])
+        # 原词与变体都在：严格路径与扩展路径同时召回
+        self._add('both_paths.pdf', '双路径页', [
+            'the frozen updates and freezes of updates are recorded.',
+        ])
+
+    def test_inflection_body_hit_is_not_title_only(self):
+        hits = {r.title: r for r in search(self.store, 'frozen updates')}
+        self.assertIn('词形页', hits, 'expanded forms must recall the page')
+        self.assertEqual(hits['词形页'].status, 'body_matched_no_highlight')
+        self.assertEqual(hits['词形页'].snippet, '', 'no original term -> no highlight')
+
+    def test_real_title_hit_stays_title_only(self):
+        hits = {r.title: r for r in search(self.store, 'frozen updates')}
+        self.assertIn('frozen updates', hits, 'title still recalls')
+        self.assertEqual(hits['frozen updates'].status, 'title_only')
+        self.assertEqual(hits['frozen updates'].snippet, '')
+
+    def test_status_decided_by_body_coverage_not_by_pass(self):
+        hits = {r.title: r for r in search(self.store, 'frozen updates')}
+        # 同页同时被严格与扩展召回时，原文可定位 -> 仍是 highlighted
+        self.assertEqual(hits['双路径页'].status, 'highlighted')
+        self.assertIn('[frozen]', hits['双路径页'].snippet)
+        self.assertIn('[updates]', hits['双路径页'].snippet)
+        # 仅扩展召回的页走 body_matched_no_highlight，二者互不污染
+        self.assertEqual(hits['词形页'].status, 'body_matched_no_highlight')
+        self.assertEqual(hits['frozen updates'].status, 'title_only')
+
+    def test_coverage_threshold_not_relaxed_for_status(self):
+        # 正文只覆盖 1 个概念（freezes），不到 min_hits=2：
+        # 页面靠标题进了结果，正文覆盖不足 -> 必须保持 title_only
+        self._add('weak.pdf', 'frozen updates weak', [
+            'this freezes nothing else of interest.',
+        ])
+        hits = {r.title: r for r in search(self.store, 'frozen updates')}
+        self.assertIn('frozen updates weak', hits)
+        self.assertEqual(hits['frozen updates weak'].status, 'title_only')
+
+    def test_highlights_are_always_real_raw_substrings(self):
+        import re
+        for r in search(self.store, 'frozen updates'):
+            body = self.store.page_by_id(r.page_id)['body']
+            for m in re.finditer(r'\[(.*?)\]', r.snippet):
+                self.assertIn(m.group(1), body, 'fabricated highlight')
+
+    def test_nfkc_no_highlight_path_does_not_regress(self):
+        # 既有行为：长度变化归一导致偏移不可证时仍是 body_matched_no_highlight
+        self._add('lig.pdf', '连字', ['ﬁne-tuning of the model'])
+        hits = {r.title: r for r in search(self.store, 'fine')}
+        self.assertEqual(hits['连字'].status, 'body_matched_no_highlight')
+        self.assertEqual(hits['连字'].snippet, '')
 
 
 if __name__ == '__main__':

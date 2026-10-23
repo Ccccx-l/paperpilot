@@ -32,6 +32,17 @@ Retrieval runs two passes over the same index:
   body_seg tokens -- the same units MATCH runs against -- so a 'hit'
   here means what a MATCH hit means, and a stale index still misses.
 
+Query-time expansion (this pass only; the index is never rewritten):
+- inflection_family(): +/-s plurals plus a small irregular map, so
+  'updates' can reach 'update' and 'frozen' can reach 'freezes'.
+- TERM_ALIASES: document-attested abbreviation pairs only
+  (e.g. 神经语言模型 == NLM per 'Neural Language Model, 简称 NLM').
+Expanded forms live in the SAME concept group as the original term and
+are OR-ed together. A concept counts once towards coverage no matter how
+many surface forms hit, so adding variants never changes MIN_LOOSE_TERM_HITS
+semantics. Expanded forms only widen candidate recall -- evidence snippets
+still come from the original query terms at real spans in pages.body.
+
 Both candidate sets are merged and ranked by the loose BM25 score alone
 (strict hits are not pinned to the front), so a loose page can still
 enter top_k when the strict pass has already filled it. Strict stays in
@@ -57,10 +68,39 @@ SNIPPET_RADIUS = 40
 MAX_SNIPPET_WINDOWS = 3
 
 # Loose-pass admission: a multi-term query page must cover at least this
-# many discriminative terms. 2 is the only integer that satisfies both
-# sides of the eval set -- Q8's target p.45 covers just 2/4 terms (must
-# be admitted), while negative Q11 tops out at 1/3 (must be refused).
+# many CONCEPT groups. 2 is the only integer that satisfies both sides of
+# the eval set -- Q8's target p.45 covers just 2/4 concepts (must be
+# admitted), while negative Q11 tops out at 1/3 (must be refused).
+# Counting is per concept, not per surface form: 'update' + 'updates'
+# together still count as one hit.
 MIN_LOOSE_TERM_HITS = 2
+
+# Irregular English inflections that the +/-s rule cannot derive.
+# Keys and members are lowercase; lookup is casefolded. Only forms with
+# confirmed evidence in the corpus are listed (freeze/freezes/frozen on
+# LoRA p.1). Adding a family is a deliberate, reviewable act.
+_IRREGULAR_INFLECTIONS: dict[str, frozenset[str]] = {
+    'freeze': frozenset({'freeze', 'freezes', 'froze', 'frozen', 'freezing'}),
+}
+_IRREGULAR_LOOKUP: dict[str, str] = {
+    form: base for base, family in _IRREGULAR_INFLECTIONS.items() for form in family
+}
+
+# Document-attested term aliases (abbreviation -> expansion source).
+# Key is a whole CJK query run after NFKC; values are the abbreviation
+# stems whose inflection_family() becomes that concept's extra surface
+# forms. Each entry cites its definition sentence in the corpus:
+#   神经语言模型  'Neural Language Model, 简称 NLM'   (AI报告 p.3)
+#   统计语言模型  'Statistical Language Models, 简称 SLMs' (AI报告 p.2,
+#                 phrased there as 基于统计学习方法的语言模型)
+#   大语言模型    'Large Language Model, 简称 LLM'   (AI报告 p.1)
+# No machine translation, no generic synonym list -- an alias without a
+# cited definition does not belong here.
+TERM_ALIASES: dict[str, tuple[str, ...]] = {
+    '神经语言模型': ('NLM',),
+    '统计语言模型': ('SLM',),
+    '大语言模型': ('LLM',),
+}
 
 STATUS_HIGHLIGHTED = 'highlighted'
 STATUS_BODY_NO_HIGHLIGHT = 'body_matched_no_highlight'
@@ -138,21 +178,55 @@ def build_match_query(query: str) -> str:
     return ' '.join('"' + token.replace('"', '""') + '"' for token in tokens)
 
 
-def discriminative_terms(query: str) -> list[str]:
-    """Distinctive terms for the loose pass: whole Latin/digit words and CJK bigrams.
+def inflection_family(word: str) -> tuple[str, ...]:
+    """Controlled surface variants of one English/digit word (original first).
 
-    A CJK run of length >= 2 contributes only its bigrams -- bare unigrams
-    ('语', '言', ...) are far too common and would flood the OR with noise.
-    A one-character CJK run contributes itself so single-character queries
-    still work. Whole CJK runs are NOT terms: they are not FTS5 tokens
-    (the index stores unigrams + bigrams), so counting them as covered
-    would not mean the same thing as a MATCH hit.
+    Rules, both sides derivable and unit-tested:
+    - +/-s plural/third-person, derived from the original spelling so
+      'NLM' yields 'NLMs' (not 'nlms'): 'updates' -> 'update',
+      'weight' -> 'weights'. Words ending in 'ss' ('class') only gain +s.
+    - irregular families from _IRREGULAR_INFLECTIONS, looked up
+      casefolded in either direction ('frozen' -> whole freeze family).
 
-    Every returned term is itself one index token, so coverage can be
-    checked with plain token membership.
+    No broad suffix truncation (-ed/-ing stripping is deliberately absent:
+    it would invent junk stems like 'used' -> 'us'). Extend the irregular
+    table when corpus evidence demands another family. Comparison and
+    MATCH are both case-insensitive, so spelling here is for stable
+    ordering and readable tests.
+    """
+    raw = word.strip()
+    if not raw:
+        return ()
+    lower = raw.casefold()
+    if lower in _IRREGULAR_LOOKUP:
+        family = _IRREGULAR_INFLECTIONS[_IRREGULAR_LOOKUP[lower]]
+        return (raw,) + tuple(sorted(family - {lower}))
+    if len(raw) > 2 and raw[-1] in 'sS' and raw[-2:-1] not in 'sS':
+        return (raw, raw[:-1])          # updates -> update
+    if len(raw) > 2 and raw[-1] in 'sS':
+        return (raw,)                   # -ss words ('class') get no +/-s partner
+    return (raw, raw + 's')             # update -> updates
+
+
+def concept_groups(query: str) -> list[tuple[str, ...]]:
+    """Logical concept groups for the loose pass.
+
+    Each group is one concept with its surface variants (original term,
+    inflection forms, attested aliases). Exactly one coverage hit per
+    group, however many variants match -- so expansion never shifts the
+    MIN_LOOSE_TERM_HITS threshold.
+
+    Grouping rules:
+    - Latin/digit run -> one group whose variants are inflection_family().
+    - CJK run of length >= 2 -> one group per bigram (bare unigrams are
+      far too common and would flood the OR; whole runs are not FTS5
+      tokens). If the run is a TERM_ALIASES key, one extra group holds
+      the abbreviation's inflection family.
+    - one-character CJK run -> one group of itself, so single-character
+      queries still work.
     """
     query = unicodedata.normalize('NFKC', query)
-    terms: list[str] = []
+    groups: list[tuple[str, ...]] = []
     i = 0
     n = len(query)
     while i < n:
@@ -163,24 +237,39 @@ def discriminative_terms(query: str) -> list[str]:
                 j += 1
             run = query[i:j]
             if len(run) == 1:
-                terms.append(run)
+                groups.append((run,))
             else:
-                terms.extend(run[k:k + 2] for k in range(len(run) - 1))
+                for k in range(len(run) - 1):
+                    groups.append((run[k:k + 2],))
+                for alias in TERM_ALIASES.get(run, ()):
+                    groups.append(inflection_family(alias))
             i = j
         elif char.isalnum():
             j = i
             while j < n and query[j].isalnum() and not is_cjk(query[j]):
                 j += 1
-            terms.append(query[i:j])
+            groups.append(inflection_family(query[i:j]))
             i = j
         else:
             i += 1
+    return groups
+
+
+def discriminative_terms(query: str) -> list[str]:
+    """Flat view of concept_groups(): every surface form, deduped, stable order.
+
+    Used to build the loose MATCH expression. Coverage must be computed
+    with concept_coverage() instead, so variants of one concept cannot
+    be counted twice.
+    """
     seen = set()
     unique = []
-    for term in terms:
-        if term and term not in seen:
-            seen.add(term)
-            unique.append(term)
+    for group in concept_groups(query):
+        for term in group:
+            key = term.casefold()
+            if key not in seen:
+                seen.add(key)
+                unique.append(term)
     return unique
 
 
@@ -204,13 +293,27 @@ def min_term_hits(term_count: int) -> int:
 
 
 def term_coverage(page_tokens: set[str], terms: list[str]) -> int:
-    """How many discriminative terms this page's index tokens contain.
+    """How many surface forms this page's index tokens contain.
 
     ``page_tokens`` must already be casefolded, matching FTS5's unicode61
     folding. Membership is exact-token, never substring: 'weight' must not
     count as covering 'weights', because MATCH would not match it either.
     """
     return sum(1 for term in terms if term.casefold() in page_tokens)
+
+
+def concept_coverage(page_tokens: set[str], groups: list[tuple[str, ...]]) -> int:
+    """How many CONCEPTS this page covers (one hit per group, variants shared).
+
+    This is the number MIN_LOOSE_TERM_HITS is compared against. A concept
+    matches when ANY of its surface forms is an index token, so adding
+    'update' alongside 'updates' widens recall but cannot inflate the
+    coverage count past one for that concept.
+    """
+    return sum(
+        1 for group in groups
+        if any(term.casefold() in page_tokens for term in group)
+    )
 
 
 def _index_tokens(body_seg: str) -> set[str]:
@@ -375,6 +478,22 @@ def search(store: PaperStore, query: str, *, top_k: int = DEFAULT_TOP_K) -> list
     merging still guards the boundary cases and keeps the two sources
     visible in the code.
 
+    Loose candidates come from concept_groups(): inflection forms and
+    attested aliases are OR-ed in for recall, but coverage is counted per
+    concept (see concept_coverage), so the MIN_LOOSE_TERM_HITS threshold
+    still means "this many distinct query concepts", not "this many
+    surface strings". Evidence snippets always use the ORIGINAL query
+    terms (evidence_terms) at real spans in pages.body -- an expanded
+    form can pull a page in, but never paints a highlight.
+
+    Status correction: when the original query strings cannot be located
+    in pages.body (locate_snippet says title_only) but the indexed body
+    still satisfies the SAME concept-coverage rule as the loose pass, the
+    page really matched via expanded forms in its body. Reporting that as
+    title_only would be a lie, so it becomes body_matched_no_highlight.
+    The check is coverage-based, never "did the strict pass see it": one
+    page can arrive through both passes, and only the body decides.
+
     Ranking is score-only on purpose: strict hits are NOT pinned above
     loose ones. Otherwise a strict result list that already fills top_k
     would lock out a genuinely relevant page that only the loose pass
@@ -384,9 +503,9 @@ def search(store: PaperStore, query: str, *, top_k: int = DEFAULT_TOP_K) -> list
     if not match_expr:
         return []
     terms = evidence_terms(query)
-    loose_terms = discriminative_terms(query)
-    loose_expr = build_loose_match(loose_terms)
-    required = min_term_hits(len(loose_terms))
+    groups = concept_groups(query)
+    loose_expr = build_loose_match(discriminative_terms(query))
+    required = min_term_hits(len(groups))
 
     candidates: dict[tuple[int, int], dict] = {}
 
@@ -400,6 +519,7 @@ def search(store: PaperStore, query: str, *, top_k: int = DEFAULT_TOP_K) -> list
                 'page_id': row['page_id'],
                 'page_no': row['page_no'],
                 'body': row['body'],
+                'body_seg': row['body_seg'],
                 'score': score,
             }
         elif score < entry['score']:
@@ -408,7 +528,7 @@ def search(store: PaperStore, query: str, *, top_k: int = DEFAULT_TOP_K) -> list
     if loose_expr:
         for row in _match_rows(store, loose_expr):
             page_tokens = _index_tokens(row['body_seg'])
-            if term_coverage(page_tokens, loose_terms) >= required:
+            if concept_coverage(page_tokens, groups) >= required:
                 remember(row, row['score'])
 
     for row in _match_rows(store, match_expr):
@@ -421,6 +541,15 @@ def search(store: PaperStore, query: str, *, top_k: int = DEFAULT_TOP_K) -> list
     results = []
     for item in ranked[: int(top_k)]:
         snippet = locate_snippet(item['body'], terms)
+        status = snippet.status
+        if status == STATUS_TITLE_ONLY:
+            # Original query strings absent from pages.body. If the indexed
+            # body still covers enough CONCEPTS, this is a body hit through
+            # expanded forms (inflection/alias), not a title-only hit. Same
+            # threshold as candidate admission -- no separate looser bar.
+            page_tokens = _index_tokens(item['body_seg'])
+            if concept_coverage(page_tokens, groups) >= required:
+                status = STATUS_BODY_NO_HIGHLIGHT
         results.append(
             Evidence(
                 paper_id=item['paper_id'],
@@ -429,7 +558,7 @@ def search(store: PaperStore, query: str, *, top_k: int = DEFAULT_TOP_K) -> list
                 page_no=item['page_no'],
                 snippet=snippet.text,
                 score=item['score'],
-                status=snippet.status,
+                status=status,
             )
         )
     return results
