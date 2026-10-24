@@ -229,6 +229,47 @@ class TestSearchTool(ToolsTestBase):
         self.assertIn('no results', out)
         self.assertNotIn('《', out, 'no invented citations')
 
+    def test_search_snippet_carries_source_label(self):
+        """搜索片段必须带来源标识，说明它不是整页原文。"""
+        self.add_doc('q', '量子计算导论', ['本文研究量子计算的基本原理。'])
+        out = search_papers(SearchPapersInput(query='量子计算'), cfg=self.cfg)
+        self.assertIn('[search snippets only', out)
+        self.assertIn('NOT full page text', out)
+        self.assertIn('read_paper_page', out, 'must tell the model to read the page')
+        self.assertIn('(snippet)', out, 'each fragment is labelled as a snippet')
+
+    def test_search_snippet_label_precedes_every_fragment(self):
+        self.add_doc('a', '甲文', ['甲内容甲内容甲内容。'])
+        self.add_doc('b', '乙文', ['乙内容乙内容乙内容。'])
+        out = search_papers(SearchPapersInput(query='内容', top_k=5), cfg=self.cfg)
+        snippet_lines = [ln for ln in out.splitlines() if '(snippet)' in ln]
+        self.assertGreaterEqual(len(snippet_lines), 1)
+        for ln in snippet_lines:
+            self.assertTrue(ln.strip().startswith('(snippet)'), ln)
+
+
+class TestSystemPromptEvidenceRule(ToolsTestBase):
+    """系统提示词必须强制整页读取，并禁止把 snippet 当作已核验引文。"""
+
+    def test_prompt_requires_read_paper_page_before_quoting(self):
+        from paperpilot.cli import PAPER_SYSTEM_PROMPT
+        self.assertIn('REQUIRED before any', PAPER_SYSTEM_PROMPT)
+        self.assertIn('read_paper_page', PAPER_SYSTEM_PROMPT)
+        self.assertIn('call read_paper_page', PAPER_SYSTEM_PROMPT)
+
+    def test_prompt_forbids_quoting_search_snippets(self):
+        from paperpilot.cli import PAPER_SYSTEM_PROMPT
+        self.assertIn('MUST quote from the full page text', PAPER_SYSTEM_PROMPT)
+        self.assertIn('ONLY for', PAPER_SYSTEM_PROMPT)
+        self.assertIn('never present it as a verified', PAPER_SYSTEM_PROMPT)
+        # 回归锁定：不得重新出现"以 snippet 作为引文"的旧措辞
+        self.assertNotIn('should quote the evidence snippet', PAPER_SYSTEM_PROMPT)
+
+    def test_prompt_requires_honest_shortfall(self):
+        from paperpilot.cli import PAPER_SYSTEM_PROMPT
+        self.assertIn('say so plainly', PAPER_SYSTEM_PROMPT)
+        self.assertIn('Never invent', PAPER_SYSTEM_PROMPT)
+
     def test_search_top_k(self):
         for i in range(4):
             self.add_doc(f'p{i}', f'量子专题{i}', ['量子内容'])

@@ -118,14 +118,19 @@ def search_papers(inp: SearchPapersInput, cfg = CONFIG) -> str:
             f'no results for query {inp.query!r}. '
             'Try fewer or different keywords; do not cite anything without evidence.'
         )
-    lines = []
+    lines = [
+        '[search snippets only -- NOT full page text] These are retrieval '
+        'fragments for locating the right paper/page. Before quoting any '
+        'paper wording, call read_paper_page with the paper_id and page_no '
+        'and quote from the full page text it returns.',
+    ]
     for index, ev in enumerate(results, start=1):
         lines.append(
             f'{index}. 《{ev.title}》 p.{ev.page_no} '
             f'(paper_id={ev.paper_id}, score={ev.score:.6f})'
         )
         if ev.snippet:
-            lines.append(f'   {ev.snippet}')
+            lines.append(f'   (snippet) {ev.snippet}')
         elif ev.status == STATUS_BODY_NO_HIGHLIGHT:
             lines.append(
                 '   (body matched; original query terms could not be located '
