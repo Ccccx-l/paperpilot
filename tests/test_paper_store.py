@@ -222,6 +222,10 @@ class TestTransactions(StoreTestBase):
     def test_update_failure_keeps_previous_record_intact(self):
         self.write_pdf('a.pdf', ['good v1'])
         first = self.store.import_pdf(self.papers_dir / 'a.pdf', cfg=self.cfg)
+        fts_before = self.store.conn.execute(
+            'SELECT rowid, title, body_seg FROM pages_fts ORDER BY rowid'
+        ).fetchall()
+        self.assertEqual(len(fts_before), 1, 'v1 must have exactly one indexed page')
         self.write_pdf('a.pdf', ['good v2', 'extra'])
         with mock.patch('paperpilot.store.segment', side_effect=RuntimeError('boom')):
             with self.assertRaises(RuntimeError):
@@ -231,6 +235,14 @@ class TestTransactions(StoreTestBase):
         self.assertEqual(row['page_count'], 1)
         body = self.store.conn.execute('SELECT body FROM pages').fetchone()[0]
         self.assertEqual(body, 'good v1', 'rollback must keep the previous pages')
+        fts_after = self.store.conn.execute(
+            'SELECT rowid, title, body_seg FROM pages_fts ORDER BY rowid'
+        ).fetchall()
+        self.assertEqual(
+            [(r['rowid'], r['title'], r['body_seg']) for r in fts_after],
+            [(r['rowid'], r['title'], r['body_seg']) for r in fts_before],
+            'rollback must restore the previous FTS5 index exactly',
+        )
 
     def test_parse_failure_leaves_db_untouched(self):
         bad = self.papers_dir / 'bad.pdf'
