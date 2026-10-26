@@ -78,7 +78,19 @@ mkdir -p papers
 cp /path/to/your/*.pdf papers/
 ```
 
-### 5. 跑通一次完整流程
+### 5. 启动 Web 工作台（推荐）
+
+```bash
+uv run python -m paperpilot.web
+```
+
+浏览器打开 **http://127.0.0.1:8001/**，获得：
+- 研究对话区（Markdown 渲染）
+- 论文列表、元数据、原文阅读器
+- 底部工具执行流水线（导入/检索/读原文/引文核验）
+- 论文导入、多轮对话、历史恢复
+
+### 6. 或使用 CLI 模式
 
 先看帮助：
 
@@ -187,4 +199,12 @@ uv run ruff check src tests                        # 静态检查
 uv lock --check                                    # 锁文件一致性
 ```
 
-代码结构见 `src/paperpilot/`（论文工具）与 `src/mini_harness/`（Agent harness）。
+代码结构见 `src/paperpilot/`（论文工具 + Web 工作台）与 `src/mini_harness/`（Agent harness）。
+
+详细文档：
+
+| 文档 | 内容 |
+|---|---|
+| [docs/INSTALL.md](docs/INSTALL.md) | 安装、启动、常见问题排查 |
+| [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | 全量配置项、模型预算、Provider 对比 |
+| [docs/OPERATIONS.md](docs/OPERATIONS.md) | 论文导入、数据管理、备份恢复、运维 |
