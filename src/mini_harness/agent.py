@@ -1,8 +1,9 @@
+import copy
 import os
 import json
 import time
 
-from openai import OpenAI, LengthFinishReasonError
+from openai import OpenAI, LengthFinishReasonError, BadRequestError
 from pathlib import Path
 from dataclasses import dataclass, asdict
 
@@ -12,6 +13,31 @@ from mini_harness.compact import COMPACT
 from mini_harness.tool.box import _ask_human, _always_allow, ToolExecution, _to_api_tool, _atomic_write, log_tool
 from mini_harness.tool.tag import OUTCOME, MARK
 from mini_harness.tool.block import CLIP
+
+
+class ContextOverflowError(Exception):
+    """The model rejected the request because it exceeds the context window.
+
+    Distinct from network/service failures: the fix is to shrink history and
+    retry a SMALLER request, never to resend the same oversized payload.
+    """
+
+
+_OVERFLOW_MARKERS = (
+    'maximum context length',
+    'context length exceeded',
+    'too many tokens',
+    'prompt is too long',
+    'input is too long',
+)
+
+
+def _is_context_overflow(exc: BaseException) -> bool:
+    """True when the model rejected the request for exceeding its context."""
+    if isinstance(exc, ContextOverflowError):
+        return True
+    msg = str(exc).lower()
+    return any(m in msg for m in _OVERFLOW_MARKERS)
 
 @dataclass(frozen = True)
 class Result:
@@ -29,7 +55,7 @@ class Result:
 
 
 class DeepSeekAgent:
-    def __init__(self, tools: list, cfg = CONFIG) -> None:
+    def __init__(self, tools: list, cfg = CONFIG, memory_enabled: bool = True) -> None:
         self.tools = _to_api_tool(tools)
         self.regis = {t.name: t for t in tools}
         # Config priority. The constructor cfg fixes the system prompt (built
@@ -52,7 +78,41 @@ class DeepSeekAgent:
         self.session_memory = cfg.session_path if cfg.session_path else cfg.work_space/'session.json'
         self.last_usage = None
         self.last_reasoning = ''
+        # Index into self.message where the CURRENT turn's own messages begin
+        # (i.e. the index of the user message that opened this turn). System
+        # messages are always before it. Web verification slices from here so
+        # prior turns can never vouch for this turn's quotations. Set by
+        # run_task(); falls back to 0 for the interactive run() loop.
+        # NOTE: compaction may rebuild self.message and invalidate this index;
+        # prefer self.turn_messages (below) for evidence boundaries.
+        self.turn_start = 0
+        # Append-only record of the CURRENT turn's messages: the user message
+        # that opened the turn, assistant answers/tool_calls, real tool results
+        # and truncated/interrupted fillers. Reset at the start of every
+        # run_task()/run() iteration. Unlike self.message it is NOT rebuilt by
+        # COMPACT, so it stays a reliable evidence boundary even after context
+        # compaction. Web evidence extraction must use this list.
+        self.turn_messages: list = []
+        # When False, _save_memory() is a no-op AND the compaction history log
+        # is not written to the shared mini_harness_history.jsonl. Web sessions
+        # keep history in their own SessionStore and must never write the
+        # shared session.json or the shared compact log (each request would
+        # otherwise clobber it). CLI/interactive paths leave this True and keep
+        # the original persistence behaviour.
+        self.memory_enabled = memory_enabled
         return
+
+    def _record(self, msg: dict) -> dict:
+        """Append one message to both the live context and the turn record.
+
+        Every message that enters ``self.message`` during a turn goes through
+        here so ``turn_messages`` stays a complete, append-only mirror of the
+        current turn. Compaction rewrites ``self.message`` but never touches
+        ``turn_messages``.
+        """
+        self.message.append(msg)
+        self.turn_messages.append(msg)
+        return msg
 
     def _load_memory(self, cfg = None) -> list:
         cfg = self.cfg if cfg is None else cfg
@@ -69,6 +129,8 @@ class DeepSeekAgent:
         return self.message
 
     def _save_memory(self, quiet: bool = False,  cfg = None) -> None:
+        if not self.memory_enabled:
+            return
         cfg = self.cfg if cfg is None else cfg
         try:
             data = json.dumps(self.message, indent = 2, ensure_ascii=False)
@@ -146,10 +208,49 @@ class DeepSeekAgent:
         done = [t['tool_call_id'] for t in self.message if t['role'] == 'tool']
         for tool_call in tool_calls:
             if tool_call.id not in done:
-                self.message.append(
+                self._record(
                     {'role': 'tool', 'tool_call_id': tool_call.id, 'content': f'[intterupted]: the tool {tool_call.function.name} is intterupted'}
                 )
         return
+
+    def _compact_now(self, client: OpenAI, cfg = None) -> None:
+        """Force context compaction now (reuses the existing COMPACT path)."""
+        cfg = self.cfg if cfg is None else cfg
+        compact_log = self.session_memory if self.memory_enabled else None
+        self.message = COMPACT.compact_content(client, self.message, compact_log, cfg = cfg)
+        self._save_memory(quiet=True, cfg=cfg)
+        self.last_prompt_tokens = 0
+
+    def _request_with_overflow_recovery(self, client: OpenAI, cfg = None):
+        """Send the request, recovering from context-overflow once.
+
+        On a context-length rejection the history is compacted and the
+        request is retried ONCE with the smaller payload. A second overflow
+        raises ``ContextOverflowError`` -- the same oversized request is never
+        sent repeatedly. Non-overflow failures keep their own error classes
+        so callers can tell them apart.
+        """
+        cfg = self.cfg if cfg is None else cfg
+        try:
+            return retry_call(lambda: self._request_agent(client, cfg = cfg), cfg = cfg)
+        except Exception as e:
+            if not _is_context_overflow(e):
+                raise
+            if getattr(self, '_overflow_recovered', False):
+                # Already compacted and retried once this task -- do not loop.
+                raise ContextOverflowError(
+                    f'context still too long after compaction: {e}') from e
+            self._overflow_recovered = True
+            print(f'[overflow]: context too long, compacting and retrying once: '
+                  f'{type(e).__name__}')
+            self._compact_now(client, cfg)
+            try:
+                return retry_call(lambda: self._request_agent(client, cfg = cfg), cfg = cfg)
+            except Exception as e2:
+                if _is_context_overflow(e2):
+                    raise ContextOverflowError(
+                        f'context still too long after compaction: {e2}') from e2
+                raise
 
     def _run_turn(self, client: OpenAI, executer: ToolExecution, cfg = None) -> Result:
         cfg = self.cfg if cfg is None else cfg
@@ -168,13 +269,16 @@ class DeepSeekAgent:
                 turns += 1
                 self.printed = ''
                 if self.last_prompt_tokens >= cfg.compact_limit:
-                    self.message = COMPACT.compact_content(client, self.message, self.session_memory, cfg = cfg)
-                    self._save_memory(quiet=True, cfg=cfg)
-                    self.last_prompt_tokens = 0
-                response, truncated = retry_call(lambda: self._request_agent(client, cfg = cfg), cfg = cfg)
+                    # Compaction rebuilds self.message (and may write the shared
+                    # mini_harness_history.jsonl next to session_memory). When
+                    # memory is disabled (web sessions) the shared log must not
+                    # be written at all -- each browser session keeps its own
+                    # history and must not leak into the CLI log.
+                    self._compact_now(client, cfg)
+                response, truncated = self._request_with_overflow_recovery(client, cfg)
                 if truncated is not None:
                     note = ('\n\n[Your previous response was cut off at the output token limit. Be more concise, or take an action instead of continuing to reason.]')
-                    self.message.append({
+                    self._record({
                         'role': 'assistant', 'content': truncated + note,
                         'reasoning_content': self.last_reasoning
                     })
@@ -197,7 +301,7 @@ class DeepSeekAgent:
                 if message.tool_calls:
                     print()
                     d = message.model_dump(exclude_none = True)
-                    self.message.append(d)
+                    self._record(d)
                     try:
                         for tool_call in message.tool_calls:
                             res = executer.execute_tool(tool_call, cfg =cfg)
@@ -210,9 +314,9 @@ class DeepSeekAgent:
                                     print(f'\n-=-=-=-=-= Todo List -=-=-=-=-=\n{res.content}')
                             else:
                                 by_tag[res.tag] = by_tag.get(res.tag, 0) + 1
-                            self.message.append(
+                            self._record(
                                 {'role': 'tool', 'tool_call_id': tool_call.id, 'content': content}
-                            ) 
+                            )
                             log_tool(tool_call, res, cfg = cfg)
                     except KeyboardInterrupt:
                         self._fill_interrupted(message.tool_calls, cfg = cfg)
@@ -220,7 +324,7 @@ class DeepSeekAgent:
                     self._save_memory(quiet=True, cfg=cfg)
                 else:
                     outcome = OUTCOME.COMPLETED
-                    self.message.append(
+                    self._record(
                         message.model_dump(exclude_none=True)
                     )
                     self._save_memory(quiet=True, cfg=cfg)
@@ -232,6 +336,11 @@ class DeepSeekAgent:
         except KeyboardInterrupt:
             outcome = OUTCOME.INTERRUPTED
             print(f'[intterupted]: the action was intterupted')
+            self._save_memory(quiet=True, cfg=cfg)
+        except ContextOverflowError as e:
+            outcome = OUTCOME.ERROR
+            err = f'ContextOverflowError:{e}'
+            print(f'[overflow]: context still too long after recovery: {e}')
             self._save_memory(quiet=True, cfg=cfg)
         except Exception as e:
             outcome = OUTCOME.ERROR
@@ -252,16 +361,32 @@ class DeepSeekAgent:
             err = err
         )
 
-    def run_task(self, task: str, cfg = None) -> Result:
+    def run_task(self, task: str, cfg = None, prior: list | None = None) -> Result:
+        """Run one task, optionally continuing from ``prior`` messages.
+
+        ``prior`` is a message history (no system message) from an earlier
+        turn of the same conversation. It is deep-copied into ``self.message``
+        so the caller's list is never aliased or mutated. The resulting order
+        is always ``system + prior + current user``. ``self.turn_start`` is
+        recorded as the index of the current user message, and
+        ``self.turn_messages`` holds the append-only record of this turn only.
+
+        Default ``prior=None`` keeps the original single-task behaviour.
+        """
         cfg = self.cfg if cfg is None else cfg
         self.message = list(self.system)
+        if prior:
+            self.message.extend(copy.deepcopy(list(prior)))
+        self.turn_start = len(self.message)
+        self.turn_messages = []
+        self._overflow_recovered = False
         client = OpenAI(
             api_key = cfg.api_key,
             base_url = cfg.base_url,
             max_retries = 0
-        ) 
+        )
         executer = ToolExecution(self.regis, _always_allow, cfg = cfg)
-        self.message.append(
+        self._record(
             {'role': 'user', 'content': task}
         )
         result = self._run_turn(client, executer, cfg = cfg)
@@ -317,7 +442,9 @@ class DeepSeekAgent:
                 print('\nBye!')
                 break
 
-            self.message.append(
+            self.turn_start = len(self.message)
+            self.turn_messages = []
+            self._record(
                 {'role': 'user', 'content': user_input}
             )
             pending_exits = False

@@ -270,6 +270,38 @@ class PaperStore:
             'SELECT * FROM papers WHERE source_path = ?', (source_path,)
         ).fetchone()
 
+    def get_paper_by_id(self, paper_id: int) -> sqlite3.Row | None:
+        """Read-only paper metadata lookup by id (web API)."""
+        return self.conn.execute(
+            'SELECT paper_id, title, source_path, sha256, page_count, imported_at '
+            'FROM papers WHERE paper_id = ?',
+            (paper_id,),
+        ).fetchone()
+
+    def list_papers(self) -> list:
+        """Read-only listing of indexed papers (web API).
+
+        Reads only the papers table -- never scans the filesystem or PDFs.
+        """
+        return self.conn.execute(
+            'SELECT paper_id, title, source_path, sha256, page_count, imported_at '
+            'FROM papers ORDER BY paper_id'
+        ).fetchall()
+
+    def read_page(self, paper_id: int, page_no: int) -> sqlite3.Row | None:
+        """Read-only full-page original text (web API).
+
+        Returns the raw ``pages.body`` stored at import time -- never the
+        segmented FTS copy, never a synthesized page.
+        """
+        return self.conn.execute(
+            'SELECT p.paper_id, p.title, p.source_path, p.page_count, '
+            '       pg.page_no, pg.body '
+            'FROM pages pg JOIN papers p ON p.paper_id = pg.paper_id '
+            'WHERE pg.paper_id = ? AND pg.page_no = ?',
+            (paper_id, page_no),
+        ).fetchone()
+
     def page_by_id(self, page_id: int) -> sqlite3.Row | None:
         """Raw page row: join key from pages_fts.rowid back to原文."""
         return self.conn.execute(

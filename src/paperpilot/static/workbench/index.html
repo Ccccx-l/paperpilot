@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PaperPilot 研究工作台</title>
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+
+<header class="topbar" id="topbar">
+  <div class="topbar-left">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <span class="brand-name">PaperPilot</span>
+      <span class="brand-sub">研究工作台</span>
+    </div>
+  </div>
+
+  <div class="topbar-mid">
+    <div class="stat">
+      <span class="stat-k">工作区</span>
+      <span class="stat-v mono" id="stat-workspace">—</span>
+    </div>
+    <div class="stat">
+      <span class="stat-k">论文</span>
+      <span class="stat-v" id="stat-papers">0 篇</span>
+    </div>
+  </div>
+
+  <div class="topbar-right">
+    <span class="svc" id="svc-status" data-svc="ok">
+      <span class="svc-dot" aria-hidden="true"></span>
+      <span class="svc-text" id="svc-text">本地服务 · 就绪</span>
+    </span>
+  </div>
+</header>
+
+<main class="workspace">
+
+  <section class="pane pane-chat" id="pane-chat" aria-label="研究对话">
+    <div class="pane-head">
+      <h2 class="pane-title">研究对话</h2>
+      <div class="pane-head-right">
+        <button class="btn btn-ghost" id="btn-reset" type="button">清空对话</button>
+        <button class="btn btn-ghost" id="btn-scroll-latest" type="button">回到最新</button>
+      </div>
+    </div>
+
+    <div class="chat-scroll" id="chat-scroll">
+      <div class="chat-empty" id="chat-empty">
+        <div class="empty-title">就绪，请输入研究问题</div>
+        <div class="empty-sub">回答中的证据以卡片展示，点击「跳转原文」可核对整页原文。</div>
+      </div>
+    </div>
+  </section>
+
+  <section class="pane pane-work" id="pane-work" aria-label="论文与证据工作区">
+    <div class="pane-head">
+      <h2 class="pane-title">论文与证据</h2>
+    </div>
+
+    <div class="work-top">
+      <div class="paper-list-wrap">
+        <div class="sub-label">已导入论文</div>
+        <ul class="paper-list" id="paper-list" role="listbox" aria-label="论文列表"></ul>
+        <div class="import-row">
+          <input class="import-input mono" id="import-dir" type="text"
+                 value="papers" aria-label="论文目录">
+          <button class="btn btn-ghost" id="btn-import" type="button">导入论文</button>
+        </div>
+        <div class="import-msg" id="import-msg"></div>
+      </div>
+      <div class="paper-meta" id="paper-meta">
+        <div class="sub-label">论文元数据</div>
+        <div class="meta-body" id="meta-body">
+          <div class="reader-placeholder">未选中论文</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="reader" id="reader">
+      <div class="reader-head">
+        <div class="sub-label">原文阅读</div>
+        <div class="reader-nav">
+          <button class="btn btn-icon" id="btn-prev-page" type="button" title="上一页">‹</button>
+          <span class="reader-pos mono" id="reader-pos">p.— / —</span>
+          <button class="btn btn-icon" id="btn-next-page" type="button" title="下一页">›</button>
+          <input class="page-input mono" id="page-input" type="text" inputmode="numeric"
+                 placeholder="页码" aria-label="跳转页码">
+          <button class="btn btn-ghost" id="btn-goto-page" type="button">跳转</button>
+        </div>
+      </div>
+
+      <div class="reader-body" id="reader-body">
+        <div class="reader-placeholder" id="reader-placeholder">
+          选择左侧论文，或点击证据卡片上的「跳转原文」。
+        </div>
+        <article class="page-text mono" id="page-text" hidden></article>
+      </div>
+
+      <div class="origin-anchor" id="origin-anchor" hidden>
+        <div class="origin-head">
+          <span class="origin-badge" id="origin-badge">页面区域</span>
+          <span class="origin-src mono" id="origin-src"></span>
+          <span class="origin-note">定位到页面区域，未做字符级高亮</span>
+        </div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer class="bottom">
+  <div class="pipeline" id="pipeline" aria-label="任务执行状态">
+    <div class="pipe-step" data-step="import" data-state="idle">
+      <span class="pipe-dot" aria-hidden="true"></span>
+      <span class="pipe-label">导入</span>
+      <span class="pipe-detail" data-role="detail">—</span>
+    </div>
+    <div class="pipe-arrow" aria-hidden="true">→</div>
+    <div class="pipe-step" data-step="search" data-state="idle">
+      <span class="pipe-dot" aria-hidden="true"></span>
+      <span class="pipe-label">检索</span>
+      <span class="pipe-detail" data-role="detail">—</span>
+    </div>
+    <div class="pipe-arrow" aria-hidden="true">→</div>
+    <div class="pipe-step" data-step="read" data-state="idle">
+      <span class="pipe-dot" aria-hidden="true"></span>
+      <span class="pipe-label">读原文</span>
+      <span class="pipe-detail" data-role="detail">—</span>
+    </div>
+    <div class="pipe-arrow" aria-hidden="true">→</div>
+    <div class="pipe-step" data-step="verify" data-state="idle">
+      <span class="pipe-dot" aria-hidden="true"></span>
+      <span class="pipe-label">引文核验</span>
+      <span class="pipe-detail" data-role="detail">—</span>
+    </div>
+    <div class="pipe-msg" id="pipe-msg">等待任务…</div>
+  </div>
+
+  <div class="composer">
+    <form class="composer-row" id="ask-form" autocomplete="off">
+      <input class="ask-input" id="ask-input" type="text"
+             placeholder="输入研究问题，例如：这篇论文的核心方法是什么？"
+             aria-label="研究问题">
+      <button class="btn btn-primary" id="btn-ask" type="submit">提问</button>
+    </form>
+    <div class="composer-foot">
+      <span class="foot-note">回答基于本地论文索引；引文核验为逐字比对，只认本轮读取的整页原文。</span>
+    </div>
+  </div>
+</footer>
+
+<div class="toast" id="toast" hidden></div>
+
+<script src="/app.js"></script>
+</body>
+</html>

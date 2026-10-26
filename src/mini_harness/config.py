@@ -56,6 +56,10 @@ class Config:
 
     compact_limit: int = 300000
     recent_keep: int = 20
+    # Model's real total context window (input + output), e.g. 16384 for a
+    # vLLM server started with --max-model-len 16384. Used to detect and
+    # recover from context-overflow rejections. 0 = unknown / no enforcement.
+    context_limit: int = 0
 
     AGREE: frozenset = frozenset(
         {
@@ -284,10 +288,17 @@ def build_config() -> Config:
         )
     if provider == 'local':
         # Local OpenAI-compatible server, e.g. vLLM serving Qwen3-VL-8B-Instruct
+        # with --max-model-len 16384. Input + output share that total, so the
+        # output budget and the compaction threshold must both fit inside it:
+        #   compact_limit (input) + max_tokens_main (output) + protocol slack
+        #   < 16384
+        # compact_limit is where COMPACT kicks in -- it must trigger well
+        # BEFORE the request would exceed the model, not after.
         overrides.update(
             model_main='qwen3-vl-8b', model_sub='qwen3-vl-8b',
             base_url=os.environ.get('LOCAL_BASE_URL') or 'http://127.0.0.1:8000/v1',
-            max_tokens_main=8192, max_tokens_sub=4096, compact_limit=64000,
+            max_tokens_main=4096, max_tokens_sub=2048, compact_limit=9000,
+            context_limit=16384,
             think_main='default', think_sub='default',
         )
     if model is not None:

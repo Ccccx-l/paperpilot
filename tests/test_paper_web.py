@@ -1,6 +1,7 @@
 """Offline tests for the minimal PaperPilot web UI (no model calls, no real data)."""
 
 import logging
+import re
 import tempfile
 import threading
 import unittest
@@ -61,11 +62,15 @@ class TestIndex(WebTestBase):
     def test_get_root_returns_html(self):
         status, body = self.request('/')
         self.assertEqual(status, 200)
-        self.assertIn('<title>PaperPilot</title>', body)
-        self.assertIn('/import', body)
-        self.assertIn('/ask', body)
-        self.assertIn('paper_dir', body)
-        self.assertIn('question', body)
+        # GET / now serves the real workbench (contract change: the old form
+        # page was replaced by the workbench UI, which talks to the JSON API).
+        self.assertIn('<title>PaperPilot 研究工作台</title>', body)
+        self.assertIn('id="chat-scroll"', body)
+        self.assertIn('id="paper-list"', body)
+        self.assertIn('id="ask-form"', body)
+        self.assertIn('id="btn-import"', body)
+        self.assertIn('id="btn-reset"', body)
+        self.assertNotIn('data.js', body, '合成数据不得进入正式页面')
 
     def test_unknown_path_is_404(self):
         status, body = self.request('/nope')
@@ -115,7 +120,7 @@ class TestImport(WebTestBase):
 class TestAsk(WebTestBase):
     def test_ask_extracts_final_assistant_answer(self):
         class FakeAgent:
-            def __init__(self, tools, cfg=None):
+            def __init__(self, tools, cfg=None, memory_enabled=True):
                 self.message = [
                     {'role': 'user', 'content': 'q'},
                     {'role': 'assistant', 'tool_calls': [
@@ -124,7 +129,8 @@ class TestAsk(WebTestBase):
                     {'role': 'tool', 'tool_call_id': '1', 'content': 'no results'},
                     {'role': 'assistant', 'content': '这是最终回答。'},
                 ]
-            def run_task(self, question):
+                self.turn_messages = list(self.message)
+            def run_task(self, question, cfg=None, prior=None):
                 class R:
                     outcome = 'completed'
                 return R()
@@ -145,9 +151,10 @@ class TestAsk(WebTestBase):
 
     def test_ask_reports_model_failure(self):
         class BoomAgent:
-            def __init__(self, tools, cfg=None):
+            def __init__(self, tools, cfg=None, memory_enabled=True):
                 self.message = []
-            def run_task(self, question):
+                self.turn_messages = []
+            def run_task(self, question, cfg=None, prior=None):
                 raise RuntimeError('model unreachable')
 
         orig = web.DeepSeekAgent
@@ -156,14 +163,17 @@ class TestAsk(WebTestBase):
 
         status, body = self.request('/ask', {'question': 'q'})
         self.assertEqual(status, 502)
-        self.assertIn('模型调用失败', body)
-        self.assertIn('model unreachable', body)
+        # Contract change (task 三): user-facing text names the failure
+        # category without leaking the raw exception.
+        self.assertIn('查询未完成', body)
+        self.assertNotIn('model unreachable', body, '不得向用户暴露原始异常')
 
     def test_ask_reports_missing_answer(self):
         class EmptyAgent:
-            def __init__(self, tools, cfg=None):
+            def __init__(self, tools, cfg=None, memory_enabled=True):
                 self.message = [{'role': 'user', 'content': 'q'}]
-            def run_task(self, question):
+                self.turn_messages = list(self.message)
+            def run_task(self, question, cfg=None, prior=None):
                 class R:
                     outcome = 'error'
                 return R()
@@ -174,17 +184,21 @@ class TestAsk(WebTestBase):
 
         status, body = self.request('/ask', {'question': 'q'})
         self.assertEqual(status, 502)
-        self.assertIn('没有可用回答', body)
+        # Contract change (task 二/三): a query that produced no answer must
+        # NOT be reported as "no papers found" -- it is a failed query.
+        self.assertIn('查询未完成', body)
+        self.assertNotIn('没有相关论文', body, '失败不得伪装成无结果')
 
     def test_ask_tolerates_attribute_style_messages(self):
         class ObjAgent:
-            def __init__(self, tools, cfg=None):
+            def __init__(self, tools, cfg=None, memory_enabled=True):
                 class Msg:
                     role = 'assistant'
                     tool_calls = None
                     content = '对象形态回答'
                 self.message = [Msg()]
-            def run_task(self, question):
+                self.turn_messages = list(self.message)
+            def run_task(self, question, cfg=None, prior=None):
                 class R:
                     outcome = 'completed'
                 return R()
@@ -358,7 +372,8 @@ class TestQuoteVerification(_QuoteHelpers):
         pages = web._collect_read_pages(agent)
         checks = web._verify_quotes(answer, pages)
         self.assertEqual(checks[0]['status'], 'unverified')
-        self.assertIn('未读取整页原文', checks[0]['note'])
+        # wording updated per the source-display contract (section 4.4)
+        self.assertIn('未读取原文，无法逐字核验', checks[0]['note'])
 
     def test_failed_or_clipped_tool_result_not_verified(self):
         for content in ('[not found]: no paper with paper_id=9',
@@ -568,6 +583,123 @@ class TestSourceAttribution(_QuoteHelpers):
         answer = '来自 paper_id=1 p.9 的引述：\n> 神经语言模型使用神经网络来描述词序列的概率分布。'
         checks, _ = self._verify(answer)
         self.assertEqual(checks[0]['status'], 'mismatch')
+
+
+class TestEvidenceCards(_QuoteHelpers):
+    """P2: structured evidence cards (M1-M5, no character-level highlight)."""
+
+    def _card_html(self, answer, **kw):
+        agent = self._agent_with(answer, **kw)
+        pages = web._collect_read_pages(agent)
+        checks = web._verify_quotes(answer, pages)
+        return web.render_ok('回答', answer, [], checks, pages), checks
+
+    def test_three_statuses_render_distinct_badges(self):
+        cases = {
+            'verified': '引述：\n> 神经语言模型使用神经网络来描述词序列的概率分布。',
+            'mismatch': '引述：\n> 这在NLP领域产生了重大影响。',
+            'unverified': '引述：\n> 任意内容',
+        }
+        for expected, answer in cases.items():
+            with self.subTest(status=expected):
+                html, checks = self._card_html(answer, read=(expected != 'unverified'))
+                self.assertEqual(checks[0]['status'], expected)
+                self.assertIn('class="card ', html)
+                label = {'verified': '逐字核验通过', 'mismatch': '未通过逐字核验',
+                         'unverified': '未核验'}[expected]
+                self.assertIn(label, html)
+
+    def test_card_shows_paper_id_and_page(self):
+        html, checks = self._card_html('引述：\n> 神经语言模型使用神经网络来描述词序列的概率分布。')
+        self.assertEqual(checks[0]['source'], (1, 3))
+        self.assertIn('paper_id=1', html)
+        self.assertIn('p.3', html)
+
+    def test_source_missing_is_not_invented(self):
+        html, checks = self._card_html('引述：\n> 这在NLP领域产生了重大影响。')
+        self.assertIsNone(checks[0]['source'])
+        # Source-display contract (section 4): checked pages shown honestly,
+        # no invented paper id / page, no internal implementation jargon.
+        self.assertIn('已检查页面', html)
+        self.assertNotIn('不编造', html)
+
+    def test_anchor_and_jump_link_are_consistent(self):
+        html, _ = self._card_html('引述：\n> 神经语言模型使用神经网络来描述词序列的概率分布。')
+        self.assertIn('href="#src-1-3"', html)
+        self.assertIn('id="src-1-3"', html)
+        self.assertIn('跳转到原文区域', html)
+
+    def test_anchor_locates_page_region_not_chars(self):
+        html, _ = self._card_html('引述：\n> 神经语言模型使用神经网络来描述词序列的概率分布。')
+        self.assertIn('未做字符级高亮', html, 'M6 暂缓：不得声称字符级定位')
+
+    def test_unverified_never_shows_passed(self):
+        html, _ = self._card_html('引述：\n> 任意内容', read=False)
+        self.assertNotIn('逐字核验通过', html)
+        self.assertIn('未核验', html)
+
+    def test_mismatch_shows_real_original_text(self):
+        html, _ = self._card_html('引述：\n> 这在NLP领域产生了重大影响。')
+        self.assertIn('未通过逐字核验', html)
+        self.assertIn('重要影响', html, '展示的是工具真实原文')
+
+    def test_nested_quote_keeps_conservative_status(self):
+        html, checks = self._card_html('他说“外层开始“内层”结束了”')
+        self.assertEqual(checks[0]['status'], 'unverified')
+        self.assertIn('未核验', html)
+        self.assertNotIn('逐字核验通过', html)
+
+    def test_unbalanced_quote_produces_no_verified_card(self):
+        html, checks = self._card_html('他说“没有右引号')
+        self.assertEqual(checks, [])
+        self.assertNotIn('逐字核验通过', html)
+
+    def test_quote_and_original_are_html_escaped(self):
+        html, _ = self._card_html('引述：\n> <script>alert(1)</script>',
+                                 page_body='<script>alert(1)</script> 原文')
+        self.assertNotIn('<script>alert(1)</script>', html)
+        self.assertIn('&lt;script&gt;', html)
+
+    def test_no_read_page_shows_honest_note(self):
+        html, _ = self._card_html('引述：\n> 神经语言模型使用神经网络来描述词序列的概率分布。', read=False)
+        self.assertIn('未读取原文，无法逐字核验', html)
+        self.assertNotIn('逐字核验通过', html)
+
+    def test_same_page_quotes_share_unique_anchor(self):
+        """两条引文来自同一页：跳转链接均指向唯一且存在的原文区域。"""
+        answer = ('引述A：\n> 神经语言模型使用神经网络来描述词序列的概率分布。\n\n'
+                  '引述B：\n> 这在NLP领域产生了重要影响。')
+        html, checks = self._card_html(answer)
+        self.assertEqual(len(checks), 2)
+        self.assertEqual(checks[0]['source'], (1, 3))
+        self.assertEqual(checks[1]['source'], (1, 3))
+        # 共享原文区域：src-1-3 只出现一次作为 id
+        self.assertEqual(html.count('id="src-1-3"'), 1, '原文区域 id 必须唯一')
+        # 两个跳转链接都指向它
+        self.assertEqual(html.count('href="#src-1-3"'), 2, '同页引文共享跳转目标')
+        # 跳转目标确实存在
+        self.assertIn('id="src-1-3"', html)
+
+    def test_all_jump_targets_exist_and_are_unique(self):
+        """通用断言：每个 href 都有对应唯一 id，且全页 id 不重复。"""
+        answer = ('引述A：\n> 神经语言模型使用神经网络来描述词序列的概率分布。\n\n'
+                  '引述B：\n> 这在NLP领域产生了重要影响。\n\n'
+                  '引述C：\n> 神经语言模型使用神经网络来描述词序列的概率分布。')
+        html, checks = self._card_html(answer)
+        ids = re.findall(r'id="([^"]+)"', html)
+        hrefs = re.findall(r'href="#([^"]+)"', html)
+        self.assertEqual(len(ids), len(set(ids)), f'HTML id 必须唯一: {ids}')
+        for target in hrefs:
+            self.assertIn(target, ids, f'跳转目标 {target} 不存在')
+        self.assertGreaterEqual(len(checks), 2)
+
+    def test_card_itself_carries_no_duplicate_id(self):
+        """卡片容器不得携带 id，避免同页多卡片重复。"""
+        answer = ('引述A：\n> 神经语言模型使用神经网络来描述词序列的概率分布。\n\n'
+                  '引述B：\n> 这在NLP领域产生了重要影响。')
+        html, _ = self._card_html(answer)
+        self.assertEqual(html.count('id="src-1-3"'), 1, '卡片不得复制原文区 id')
+        self.assertEqual(html.count('class="card '), 2)
 
 
 if __name__ == '__main__':
